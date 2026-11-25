@@ -85,7 +85,8 @@ class IRContext {
     kAnalysisDebugInfo = 1 << 16,
     kAnalysisLiveness = 1 << 17,
     kAnalysisIdToGraphMapping = 1 << 18,
-    kAnalysisEnd = 1 << 19
+    kAnalysisEntryPointFloatControls = 1 << 19,
+    kAnalysisEnd = 1 << 20
   };
 
   using ProcessFunction = std::function<bool(Function*)>;
@@ -597,6 +598,12 @@ class IRContext {
     return GetFunction(inst->result_id());
   }
 
+  // Returns false if an entry-point floating-point control that forbids an
+  // otherwise host-equivalent constant fold is in effect for |inst|.
+  // |Shader| capability, NoContraction, and kernel rules remain the caller's
+  // responsibility.
+  bool EntryPointFloatControlsAllowFolding(Instruction* inst);
+
   // Returns the graph whose id is |id|, if one exists.  Returns |nullptr|
   // otherwise.
   Graph* GetGraph(uint32_t id) {
@@ -672,6 +679,10 @@ class IRContext {
 
   // Builds the instruction-graph map for the whole module.
   void BuildIdToGraphMapping();
+
+  // Builds the maps describing which functions are reachable from entry
+  // points and which floating-point control widths apply to them.
+  void BuildEntryPointFloatControls();
 
   void BuildDecorationManager();
 
@@ -788,6 +799,14 @@ class IRContext {
   // NOTE: Do not traverse this map. Ever. Use the graph iterators to
   // traverse instructions.
   std::unordered_map<uint32_t, Graph*> id_to_graph_;
+
+  // Functions reachable through static call trees rooted at entry points.
+  std::unordered_set<Function*> entry_reachable_functions_;
+
+  // For each reachable function, a bitset of float widths for which a
+  // conservative floating-point folding bailout is required by an entry
+  // point's execution modes.
+  std::unordered_map<Function*, uint32_t> entry_float_control_widths_;
 
   // A bitset indicating which analyzes are currently valid.
   Analysis valid_analyses_;

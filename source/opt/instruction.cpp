@@ -830,18 +830,12 @@ bool Instruction::IsFoldableByFoldVector() const {
 
 bool Instruction::IsFloatingPointFoldingAllowed() const {
   // TODO: Add the rules for kernels.  For now it will be pessimistic.
-  // For now, do not support capabilities introduced by SPV_KHR_float_controls.
-  if (!context_->get_feature_mgr()->HasCapability(spv::Capability::Shader) ||
-      context_->get_feature_mgr()->HasCapability(
-          spv::Capability::DenormPreserve) ||
-      context_->get_feature_mgr()->HasCapability(
-          spv::Capability::DenormFlushToZero) ||
-      context_->get_feature_mgr()->HasCapability(
-          spv::Capability::SignedZeroInfNanPreserve) ||
-      context_->get_feature_mgr()->HasCapability(
-          spv::Capability::RoundingModeRTZ) ||
-      context_->get_feature_mgr()->HasCapability(
-          spv::Capability::RoundingModeRTE)) {
+  if (!context_->get_feature_mgr()->HasCapability(spv::Capability::Shader)) {
+    return false;
+  }
+
+  if (!context_->EntryPointFloatControlsAllowFolding(
+          const_cast<Instruction*>(this))) {
     return false;
   }
 

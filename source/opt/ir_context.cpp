@@ -37,6 +37,33 @@ constexpr int kEntryPointExecutionModelInIdx = 0;
 // instructions.
 constexpr uint32_t kDebugFunctionOperandFunctionIndex = 13;
 constexpr uint32_t kDebugGlobalVariableOperandVariableIndex = 11;
+
+uint32_t FloatWidthControlBit(uint32_t width) {
+  switch (width) {
+    case 16:
+      return 1u << 0;
+    case 32:
+      return 1u << 1;
+    case 64:
+      return 1u << 2;
+    default:
+      return 1u << 3;
+  }
+}
+
+uint32_t AllFloatWidthControlBits() { return (1u << 4) - 1u; }
+
+void AddFloatTypeWidth(const analysis::Type* type, uint32_t* widths) {
+  if (type == nullptr) return;
+
+  if (const analysis::Float* float_type = type->AsFloat()) {
+    *widths |= FloatWidthControlBit(float_type->width());
+  } else if (const analysis::Vector* vector_type = type->AsVector()) {
+    AddFloatTypeWidth(vector_type->element_type(), widths);
+  } else if (const analysis::Matrix* matrix_type = type->AsMatrix()) {
+    AddFloatTypeWidth(matrix_type->element_type(), widths);
+  }
+}
 }  // namespace
 
 IRContext::IRContext(spv_target_env env, MessageConsumer c)
@@ -118,6 +145,147 @@ void IRContext::BuildIdToGraphMapping() {
     id_to_graph_[g->DefInst().result_id()] = g.get();
   }
   valid_analyses_ = valid_analyses_ | kAnalysisIdToGraphMapping;
+}
+
+void IRContext::BuildEntryPointFloatControls() {
+  entry_reachable_functions_.clear();
+  entry_float_control_widths_.clear();
+
+  std::queue<Function*> worklist;
+  for (const Instruction& entry_point : module_->entry_points()) {
+    Function* entry_function = GetFunction(
+        entry_point.GetSingleWordInOperand(kEntryPointFunctionIdInIdx));
+    if (entry_function != nullptr &&
+        entry_reachable_functions_.insert(entry_function).second) {
+      worklist.push(entry_function);
+    }
+  }
+
+  // Propagate ordinary entry-point reachability through static call edges.
+  while (!worklist.empty()) {
+    Function* caller = worklist.front();
+    worklist.pop();
+
+    caller->ForEachInst([this, &worklist](const Instruction* inst) {
+      if (inst->opcode() != spv::Op::OpFunctionCall) return;
+
+      Function* callee = GetFunction(inst->GetSingleWordInOperand(0));
+      if (callee != nullptr &&
+          entry_reachable_functions_.insert(callee).second) {
+        worklist.push(callee);
+      }
+    });
+  }
+
+  // Execution modes apply to the entry point and every function in its static
+  // call tree.  Multiple entry points may share a callee, in which case the
+  // union of their constraints is conservatively applied to that callee.
+  std::queue<Function*> float_control_worklist;
+  for (const Instruction& mode : module_->execution_modes()) {
+    uint32_t width = 0;
+    switch (spv::ExecutionMode(mode.GetSingleWordInOperand(1))) {
+      case spv::ExecutionMode::DenormPreserve:
+      case spv::ExecutionMode::DenormFlushToZero:
+      case spv::ExecutionMode::SignedZeroInfNanPreserve:
+      case spv::ExecutionMode::RoundingModeRTE:
+      case spv::ExecutionMode::RoundingModeRTZ:
+        width = mode.GetSingleWordInOperand(2);
+        break;
+      default:
+        continue;
+    }
+
+    Function* entry_function =
+        GetFunction(mode.GetSingleWordInOperand(kSpvDecorateTargetIdInIdx));
+    if (entry_function == nullptr) continue;
+
+    uint32_t& widths = entry_float_control_widths_[entry_function];
+    uint32_t new_widths = widths | FloatWidthControlBit(width);
+    if (new_widths != widths) {
+      widths = new_widths;
+      float_control_worklist.push(entry_function);
+    }
+  }
+
+  while (!float_control_worklist.empty()) {
+    Function* caller = float_control_worklist.front();
+    float_control_worklist.pop();
+
+    const uint32_t caller_widths = entry_float_control_widths_[caller];
+    caller->ForEachInst(
+        [this, caller_widths,
+         &float_control_worklist](const Instruction* inst) {
+          if (inst->opcode() != spv::Op::OpFunctionCall) return;
+
+          Function* callee = GetFunction(inst->GetSingleWordInOperand(0));
+          if (callee == nullptr) return;
+
+          uint32_t& callee_widths = entry_float_control_widths_[callee];
+          uint32_t new_widths = callee_widths | caller_widths;
+          if (new_widths != callee_widths) {
+            callee_widths = new_widths;
+            float_control_worklist.push(callee);
+          }
+        });
+  }
+
+  valid_analyses_ = valid_analyses_ | kAnalysisEntryPointFloatControls;
+}
+
+bool IRContext::EntryPointFloatControlsAllowFolding(Instruction* inst) {
+  if (!AreAnalysesValid(kAnalysisEntryPointFloatControls)) {
+    BuildEntryPointFloatControls();
+  }
+
+  auto has_blanket_float_control_capability = [this]() {
+    FeatureManager* features = get_feature_mgr();
+    return features->HasCapability(spv::Capability::DenormPreserve) ||
+           features->HasCapability(spv::Capability::DenormFlushToZero) ||
+           features->HasCapability(
+               spv::Capability::SignedZeroInfNanPreserve) ||
+           features->HasCapability(spv::Capability::RoundingModeRTZ) ||
+           features->HasCapability(spv::Capability::RoundingModeRTE);
+  };
+
+  BasicBlock* block = get_instr_block(inst);
+  Function* function = block == nullptr ? nullptr : block->GetParent();
+
+  // Functions with no entry-point consumer may be exported through Linkage or
+  // otherwise consumed outside this module.  Preserve the historical
+  // conservative bailout when float-control capabilities are declared but no
+  // known entry-point execution mode establishes the rules.
+  if (function == nullptr ||
+      entry_reachable_functions_.find(function) ==
+          entry_reachable_functions_.end()) {
+    return !has_blanket_float_control_capability();
+  }
+
+  const auto found = entry_float_control_widths_.find(function);
+  const uint32_t strict_widths =
+      found == entry_float_control_widths_.end() ? 0 : found->second;
+  if (strict_widths == 0) return true;
+
+  uint32_t instruction_widths = 0;
+  analysis::TypeManager* type_manager = get_type_mgr();
+  AddFloatTypeWidth(type_manager->GetType(inst->type_id()),
+                    &instruction_widths);
+  inst->WhileEachInId([this, type_manager, &instruction_widths](
+                          const uint32_t* id) {
+    Instruction* operand_inst = get_def_use_mgr()->GetDef(*id);
+    if (operand_inst != nullptr) {
+      AddFloatTypeWidth(type_manager->GetType(operand_inst->type_id()),
+                        &instruction_widths);
+    }
+    return true;
+  });
+
+  // Folding predicates are only consulted for float-related operations.  If a
+  // width cannot be classified, be conservative for every float width.
+  if (instruction_widths == 0) {
+    instruction_widths = AllFloatWidthControlBits();
+  }
+
+  return (strict_widths & instruction_widths) == 0;
 }
 
 void IRContext::BuildDecorationManager() {
@@ -246,6 +414,9 @@ void IRContext::BuildInvalidAnalyses(IRContext::Analysis set) {
   if (set & kAnalysisIdToGraphMapping) {
     BuildIdToGraphMapping();
   }
+  if (set & kAnalysisEntryPointFloatControls) {
+    BuildEntryPointFloatControls();
+  }
 }
 
 void IRContext::InvalidateAnalysesExceptFor(
@@ -274,6 +445,12 @@ void IRContext::InvalidateAnalyses(IRContext::Analysis analyses_to_invalidate) {
   if (analyses_to_invalidate & kAnalysisLoopAnalysis) {
     analyses_to_invalidate |= kAnalysisScalarEvolution;
     analyses_to_invalidate |= kAnalysisLiveness;
+  }
+
+  // The entry-point float-control cache stores raw Function pointers obtained
+  // through the id-to-function mapping, so drop it when that mapping goes away.
+  if (analyses_to_invalidate & kAnalysisIdToFuncMapping) {
+    analyses_to_invalidate |= kAnalysisEntryPointFloatControls;
   }
 
   if (analyses_to_invalidate & kAnalysisDefUse) {
@@ -334,6 +511,10 @@ void IRContext::InvalidateAnalyses(IRContext::Analysis analyses_to_invalidate) {
   }
   if (analyses_to_invalidate & kAnalysisIdToGraphMapping) {
     id_to_graph_.clear();
+  }
+  if (analyses_to_invalidate & kAnalysisEntryPointFloatControls) {
+    entry_reachable_functions_.clear();
+    entry_float_control_widths_.clear();
   }
 
   valid_analyses_ = Analysis(valid_analyses_ & ~analyses_to_invalidate);
