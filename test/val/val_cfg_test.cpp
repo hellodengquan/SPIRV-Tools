@@ -5624,6 +5624,826 @@ TEST_F(ValidateCFG, LifetimeUntypedPointerStorageClass) {
                         "Function storage class"));
 }
 
+// The tests below cover the merge rule for OpPhi values: at a merge block, the
+// OpPhi must have exactly one (value, predecessor) pair per incoming CFG edge,
+// and each value must be available on the path that its paired predecessor
+// leads in from.
+//
+// The first half of the rule is enforced by ValidatePhi in validate_cfg.cpp
+// (pair count, predecessor membership, no repeated predecessor, value types);
+// the second half is the OpPhi parent-dominance check in validate_id.cpp.  The
+// two halves reject different things, so both are exercised here: a module can
+// have the right number of pairs and still pair a value with a path it cannot
+// reach, and conversely an unreachable predecessor still contributes an edge
+// that must be listed.
+//
+// Every module is a fragment shader that picks one of two colors and stores the
+// result in an Output variable, so a failure to merge the colors is visible as
+// an invalid fragment program.  `debug_names` and `body` are the only pieces
+// that vary; ColorPhiModule supplies the capability, memory model, entry point,
+// types, and the two color constants.
+std::string ColorPhiModule(const std::string& debug_names,
+                           const std::string& body) {
+  return R"(OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out
+OpExecutionMode %main OriginUpperLeft
+)" + debug_names + R"(
+OpDecorate %out Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v4float = OpTypeVector %float 4
+%bool = OpTypeBool
+%true = OpConstantTrue %bool
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%f0 = OpConstant %float 0
+%f1 = OpConstant %float 1
+%red = OpConstantComposite %v4float %f1 %f0 %f0 %f1
+%green = OpConstantComposite %v4float %f0 %f1 %f0 %f1
+%ptr_out = OpTypePointer Output %v4float
+%out = OpVariable %ptr_out Output
+)" + body;
+}
+
+TEST_F(ValidateCFG, PhiMergeSelectionEachEdgeSuppliesValueFromItsOwnPath) {
+  // Each arm of the selection defines its own color and the merge's OpPhi
+  // pairs it with the arm it comes from.  %merge has exactly two incoming
+  // edges, %then and %else, and the two pairs name each edge once, with a
+  // value that is defined on that edge's path.
+  const std::string text = ColorPhiModule(
+      R"(OpName %then "then"
+OpName %else "else"
+OpName %merge "merge"
+OpName %color_then "color_then"
+OpName %color_else "color_else"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %true %then %else
+%then = OpLabel
+%color_then = OpCopyObject %v4float %red
+OpBranch %merge
+%else = OpLabel
+%color_else = OpCopyObject %v4float %green
+OpBranch %merge
+%merge = OpLabel
+%color = OpPhi %v4float %color_then %then %color_else %else
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions()) << getDiagnosticString();
+}
+
+TEST_F(ValidateCFG, PhiMergeSelectionSwappedPairsRejected) {
+  // The pairs are swapped: %color_then is claimed to arrive along the edge from
+  // %else, but it is defined in %then, which does not dominate %else.  The
+  // values exist, but they are not available on the paths they are paired
+  // with, so the module must be rejected.
+  const std::string text = ColorPhiModule(
+      R"(OpName %then "then"
+OpName %else "else"
+OpName %merge "merge"
+OpName %color_then "color_then"
+OpName %color_else "color_else"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %true %then %else
+%then = OpLabel
+%color_then = OpCopyObject %v4float %red
+OpBranch %merge
+%else = OpLabel
+%color_else = OpCopyObject %v4float %green
+OpBranch %merge
+%merge = OpLabel
+%color = OpPhi %v4float %color_then %else %color_else %then
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("In OpPhi instruction"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%color_then"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("definition does not dominate its parent"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%else"));
+}
+
+TEST_F(ValidateCFG, PhiMergeSelectionValueReusedForBothEdgesRejected) {
+  // Listing the same value for both edges does not make it available on both
+  // paths: %color_then is still defined only in %then, so it cannot be offered
+  // along the edge from %else.
+  const std::string text = ColorPhiModule(
+      R"(OpName %then "then"
+OpName %else "else"
+OpName %merge "merge"
+OpName %color_then "color_then"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %true %then %else
+%then = OpLabel
+%color_then = OpCopyObject %v4float %red
+OpBranch %merge
+%else = OpLabel
+OpBranch %merge
+%merge = OpLabel
+%color = OpPhi %v4float %color_then %then %color_then %else
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%color_then"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("definition does not dominate its parent"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%else"));
+}
+
+TEST_F(ValidateCFG, PhiMergeSelectionMissingEdgeRejected) {
+  // Only one pair is given for a merge block with two incoming edges.  The
+  // color chosen by the %else arm would be undefined.
+  const std::string text = ColorPhiModule(
+      R"(OpName %then "then"
+OpName %else "else"
+OpName %merge "merge"
+OpName %color_then "color_then"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %true %then %else
+%then = OpLabel
+%color_then = OpCopyObject %v4float %red
+OpBranch %merge
+%else = OpLabel
+OpBranch %merge
+%merge = OpLabel
+%color = OpPhi %v4float %color_then %then
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("OpPhi's number of incoming blocks (1) does not match "
+                        "block's predecessor count (2)."));
+}
+
+TEST_F(ValidateCFG, PhiMergeSelectionExtraEdgeRejected) {
+  // Three pairs for two incoming edges.  The extra pair names %entry, which is
+  // the block that branches into the selection rather than a predecessor of
+  // the merge; the pair count is checked first and fails.
+  const std::string text = ColorPhiModule(
+      R"(OpName %entry "entry"
+OpName %then "then"
+OpName %else "else"
+OpName %merge "merge"
+OpName %color_then "color_then"
+OpName %color_else "color_else"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %true %then %else
+%then = OpLabel
+%color_then = OpCopyObject %v4float %red
+OpBranch %merge
+%else = OpLabel
+%color_else = OpCopyObject %v4float %green
+OpBranch %merge
+%merge = OpLabel
+%color = OpPhi %v4float %color_then %then %color_else %else %color_then %entry
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("OpPhi's number of incoming blocks (3) does not match "
+                        "block's predecessor count (2)."));
+}
+
+TEST_F(ValidateCFG, PhiMergeSelectionNonPredecessorBlockRejected) {
+  // The pair count matches, but %entry is not an immediate predecessor of
+  // %merge.  Values must correspond to edges that actually reach the block.
+  const std::string text = ColorPhiModule(
+      R"(OpName %entry "entry"
+OpName %then "then"
+OpName %else "else"
+OpName %merge "merge"
+OpName %color_then "color_then"
+OpName %color_else "color_else"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %true %then %else
+%then = OpLabel
+%color_then = OpCopyObject %v4float %red
+OpBranch %merge
+%else = OpLabel
+%color_else = OpCopyObject %v4float %green
+OpBranch %merge
+%merge = OpLabel
+%color = OpPhi %v4float %color_then %then %color_else %entry
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("OpPhi's incoming basic block <id>"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%entry"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("is not a predecessor of"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%merge"));
+}
+
+TEST_F(ValidateCFG, PhiMergeSelectionRepeatedPredecessorRejected) {
+  // Two pairs name %then and none name %else, so the edge from the %else arm
+  // is left without a value even though the pair count matches.
+  const std::string text = ColorPhiModule(
+      R"(OpName %then "then"
+OpName %else "else"
+OpName %merge "merge"
+OpName %color_then "color_then"
+OpName %color_else "color_else"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %true %then %else
+%then = OpLabel
+%color_then = OpCopyObject %v4float %red
+OpBranch %merge
+%else = OpLabel
+%color_else = OpCopyObject %v4float %green
+OpBranch %merge
+%merge = OpLabel
+%color = OpPhi %v4float %color_then %then %color_else %then
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("OpPhi references incoming basic block <id>"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%then"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("multiple times."));
+}
+
+TEST_F(ValidateCFG, PhiMergeSelectionValueTypeMismatchRejected) {
+  // The value supplied along the %else edge is a scalar float, not the
+  // v4float color the phi merges.  Both arms must supply the merge type.
+  const std::string text = ColorPhiModule(
+      R"(OpName %then "then"
+OpName %else "else"
+OpName %merge "merge"
+OpName %color_then "color_then"
+OpName %f1 "scalar_one"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %true %then %else
+%then = OpLabel
+%color_then = OpCopyObject %v4float %red
+OpBranch %merge
+%else = OpLabel
+OpBranch %merge
+%merge = OpLabel
+%color = OpPhi %v4float %color_then %then %f1 %else
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("OpPhi's result type <id>"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%v4float"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%scalar_one"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%float"));
+}
+
+TEST_F(ValidateCFG, PhiMergeSelectionUnpairedOperandRejected) {
+  // An odd number of incoming operands means one value has no block and the
+  // pairs cannot map onto the incoming edges one-to-one.
+  const std::string text = ColorPhiModule(
+      R"(OpName %then "then"
+OpName %else "else"
+OpName %merge "merge"
+OpName %color_then "color_then"
+OpName %color_else "color_else"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %true %then %else
+%then = OpLabel
+%color_then = OpCopyObject %v4float %red
+OpBranch %merge
+%else = OpLabel
+%color_else = OpCopyObject %v4float %green
+OpBranch %merge
+%merge = OpLabel
+%color = OpPhi %v4float %color_then %then %color_else
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr(
+                  "OpPhi does not have an equal number of incoming values "
+                  "and basic blocks."));
+}
+
+TEST_F(ValidateCFG, PhiSingleEntryAcceptedForSameTargetBranchConditional) {
+  // OpBranchConditional %true %merge %merge produces two CFG edges but only one
+  // distinct predecessor, %entry.  The accepted module gives the merge exactly
+  // one pair for that single predecessor.
+  const std::string text = ColorPhiModule(
+      R"(OpName %entry "entry"
+OpName %merge "merge"
+OpName %color "color"
+OpName %phi "phi"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+%color = OpCopyObject %v4float %red
+OpBranchConditional %true %merge %merge
+%merge = OpLabel
+%phi = OpPhi %v4float %color %entry
+OpStore %out %phi
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions()) << getDiagnosticString();
+}
+
+TEST_F(ValidateCFG, PhiDuplicatedEntryRejectedForSameTargetBranchConditional) {
+  // Two identical pairs are given for the branch that targets %merge twice.
+  // The comparison is against the deduplicated predecessor set, which holds a
+  // single block, so the pairs cannot correspond one-to-one with the incoming
+  // blocks.  Note that the diagnostic prints the raw predecessor list length
+  // (2) rather than the deduplicated one (1), so the message quotes the same
+  // number on both sides even though the counts being compared differ.
+  const std::string text = ColorPhiModule(
+      R"(OpName %entry "entry"
+OpName %merge "merge"
+OpName %color "color"
+OpName %phi "phi"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+%color = OpCopyObject %v4float %red
+OpBranchConditional %true %merge %merge
+%merge = OpLabel
+%phi = OpPhi %v4float %color %entry %color %entry
+OpStore %out %phi
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("OpPhi's number of incoming blocks (2) does not match "
+                        "block's predecessor count (2)."));
+}
+
+TEST_F(ValidateCFG, PhiSingleEntryAcceptedForRepeatedSwitchTarget) {
+  // OpSwitch here names %merge as both the default and the target of case 1,
+  // so %merge again has two edges but one distinct predecessor.  One pair is
+  // correct.
+  const std::string text = ColorPhiModule(
+      R"(OpName %entry "entry"
+OpName %merge "merge"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpSwitch %int_0 %merge 1 %merge
+%merge = OpLabel
+%color = OpPhi %v4float %red %entry
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions()) << getDiagnosticString();
+}
+
+TEST_F(ValidateCFG, PhiDuplicatedEntryRejectedForRepeatedSwitchTarget) {
+  // As with the branch-conditional case, listing the single distinct
+  // predecessor twice does not satisfy the one-pair-per-incoming-block rule.
+  const std::string text = ColorPhiModule(
+      R"(OpName %entry "entry"
+OpName %merge "merge"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpSwitch %int_0 %merge 1 %merge
+%merge = OpLabel
+%color = OpPhi %v4float %red %entry %red %entry
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("OpPhi's number of incoming blocks (2) does not match "
+                        "block's predecessor count (2)."));
+}
+
+TEST_F(ValidateCFG, PhiLoopHeaderAcceptsPreheaderAndBackEdgeValues) {
+  // %loop is entered from the preheader %entry and from the back edge %cont, so
+  // the accepted module supplies one value per path: a constant from
+  // %entry and the incremented color from %cont.
+  const std::string text = ColorPhiModule(
+      R"(OpName %loop "loop"
+OpName %body "body"
+OpName %cont "cont"
+OpName %exit "exit"
+OpName %next "next"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpBranch %loop
+%loop = OpLabel
+%color = OpPhi %v4float %red %entry %next %cont
+OpLoopMerge %exit %cont None
+OpBranchConditional %true %body %exit
+%body = OpLabel
+OpBranch %cont
+%cont = OpLabel
+%next = OpCopyObject %v4float %green
+OpBranch %loop
+%exit = OpLabel
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions()) << getDiagnosticString();
+}
+
+TEST_F(ValidateCFG, PhiLoopHeaderMissingBackEdgeRejected) {
+  // Only the preheader path has a pair.  On the second and later iterations
+  // the phi has no value for the value arriving along the back edge from
+  // %cont.
+  const std::string text = ColorPhiModule(
+      R"(OpName %loop "loop"
+OpName %body "body"
+OpName %cont "cont"
+OpName %exit "exit"
+OpName %next "next"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpBranch %loop
+%loop = OpLabel
+%color = OpPhi %v4float %red %entry
+OpLoopMerge %exit %cont None
+OpBranchConditional %true %body %exit
+%body = OpLabel
+OpBranch %cont
+%cont = OpLabel
+%next = OpCopyObject %v4float %green
+OpBranch %loop
+%exit = OpLabel
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("OpPhi's number of incoming blocks (1) does not match "
+                        "block's predecessor count (2)."));
+}
+
+TEST_F(ValidateCFG, PhiLoopHeaderBackEdgeValueOnPreheaderPathRejected) {
+  // The pairs are swapped across the loop boundary: %next is defined in %cont
+  // and cannot be available on the first iteration when control arrives from
+  // %entry, which the pair claims.
+  const std::string text = ColorPhiModule(
+      R"(OpName %entry "entry"
+OpName %loop "loop"
+OpName %body "body"
+OpName %cont "cont"
+OpName %exit "exit"
+OpName %next "next"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpBranch %loop
+%loop = OpLabel
+%color = OpPhi %v4float %next %entry %red %cont
+OpLoopMerge %exit %cont None
+OpBranchConditional %true %body %exit
+%body = OpLabel
+OpBranch %cont
+%cont = OpLabel
+%next = OpCopyObject %v4float %green
+OpBranch %loop
+%exit = OpLabel
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%next"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("definition does not dominate its parent"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%entry"));
+}
+
+TEST_F(ValidateCFG, PhiLoopExitAcceptsValuesFromHeaderAndBody) {
+  // %exit is reached directly from the loop header and from %body, so the
+  // accepted module supplies a value defined on each of those two paths.
+  const std::string text = ColorPhiModule(
+      R"(OpName %loop "loop"
+OpName %body "body"
+OpName %cont "cont"
+OpName %exit "exit"
+OpName %color_loop "color_loop"
+OpName %color_body "color_body"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpBranch %loop
+%loop = OpLabel
+%color_loop = OpCopyObject %v4float %red
+OpLoopMerge %exit %cont None
+OpBranchConditional %true %body %exit
+%body = OpLabel
+%color_body = OpCopyObject %v4float %green
+OpBranchConditional %true %exit %cont
+%cont = OpLabel
+OpBranch %loop
+%exit = OpLabel
+%color = OpPhi %v4float %color_loop %loop %color_body %body
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions()) << getDiagnosticString();
+}
+
+TEST_F(ValidateCFG, PhiLoopExitSwappedPairsRejected) {
+  // The two exit paths are paired with each other's values: %color_body is
+  // defined in %body and is not available when the header branches straight to
+  // the exit.
+  const std::string text = ColorPhiModule(
+      R"(OpName %loop "loop"
+OpName %body "body"
+OpName %cont "cont"
+OpName %exit "exit"
+OpName %color_loop "color_loop"
+OpName %color_body "color_body"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpBranch %loop
+%loop = OpLabel
+%color_loop = OpCopyObject %v4float %red
+OpLoopMerge %exit %cont None
+OpBranchConditional %true %body %exit
+%body = OpLabel
+%color_body = OpCopyObject %v4float %green
+OpBranchConditional %true %exit %cont
+%cont = OpLabel
+OpBranch %loop
+%exit = OpLabel
+%color = OpPhi %v4float %color_loop %body %color_body %loop
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("In OpPhi instruction"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%color_body"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("definition does not dominate its parent"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%loop"));
+}
+
+TEST_F(ValidateCFG, PhiLoopExitMissingHeaderPathRejected) {
+  // Only the path from %body has a pair; the exit reached directly from the
+  // loop header would leave the stored color undefined.
+  const std::string text = ColorPhiModule(
+      R"(OpName %loop "loop"
+OpName %body "body"
+OpName %cont "cont"
+OpName %exit "exit"
+OpName %color_loop "color_loop"
+OpName %color_body "color_body"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpBranch %loop
+%loop = OpLabel
+%color_loop = OpCopyObject %v4float %red
+OpLoopMerge %exit %cont None
+OpBranchConditional %true %body %exit
+%body = OpLabel
+%color_body = OpCopyObject %v4float %green
+OpBranchConditional %true %exit %cont
+%cont = OpLabel
+OpBranch %loop
+%exit = OpLabel
+%color = OpPhi %v4float %color_loop %loop
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("OpPhi's number of incoming blocks (1) does not match "
+                        "block's predecessor count (2)."));
+}
+
+TEST_F(ValidateCFG, PhiMergeAcceptsUnreachablePredecessorEdge) {
+  // %dead cannot be reached at run time, but it is still a predecessor of
+  // %merge in the CFG.  The accepted module lists it with a value that is
+  // available on that path, so every edge is accounted for.
+  const std::string text = ColorPhiModule(
+      R"(OpName %then "then"
+OpName %else "else"
+OpName %dead "dead"
+OpName %merge "merge"
+OpName %color_then "color_then"
+OpName %color_else "color_else"
+OpName %color_dead "color_dead"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %true %then %else
+%then = OpLabel
+%color_then = OpCopyObject %v4float %red
+OpBranch %merge
+%else = OpLabel
+%color_else = OpCopyObject %v4float %green
+OpBranch %merge
+%dead = OpLabel
+%color_dead = OpCopyObject %v4float %green
+OpBranch %merge
+%merge = OpLabel
+%color = OpPhi %v4float %color_then %then %color_else %else %color_dead %dead
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions()) << getDiagnosticString();
+}
+
+TEST_F(ValidateCFG, PhiMergeMissingUnreachablePredecessorEdgeRejected) {
+  // Dropping the pair for %dead looks harmless because the block never runs,
+  // but the phi then has fewer pairs than %merge has incoming edges.
+  const std::string text = ColorPhiModule(
+      R"(OpName %then "then"
+OpName %else "else"
+OpName %dead "dead"
+OpName %merge "merge"
+OpName %color_then "color_then"
+OpName %color_else "color_else"
+OpName %color_dead "color_dead"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %true %then %else
+%then = OpLabel
+%color_then = OpCopyObject %v4float %red
+OpBranch %merge
+%else = OpLabel
+%color_else = OpCopyObject %v4float %green
+OpBranch %merge
+%dead = OpLabel
+%color_dead = OpCopyObject %v4float %green
+OpBranch %merge
+%merge = OpLabel
+%color = OpPhi %v4float %color_then %then %color_else %else
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("OpPhi's number of incoming blocks (2) does not match "
+                        "block's predecessor count (3)."));
+}
+
+TEST_F(ValidateCFG, PhiMergeUnreachableDefinitionForReachableEdgeRejected) {
+  // The value defined in the unreachable %dead block is offered along the edge
+  // from %then.  Even though the edge count matches, that definition is not
+  // available when control arrives from %then.
+  const std::string text = ColorPhiModule(
+      R"(OpName %then "then"
+OpName %else "else"
+OpName %dead "dead"
+OpName %merge "merge"
+OpName %color_then "color_then"
+OpName %color_else "color_else"
+OpName %color_dead "color_dead"
+OpName %color "color"
+)",
+      R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %true %then %else
+%then = OpLabel
+%color_then = OpCopyObject %v4float %red
+OpBranch %merge
+%else = OpLabel
+%color_else = OpCopyObject %v4float %green
+OpBranch %merge
+%dead = OpLabel
+%color_dead = OpCopyObject %v4float %green
+OpBranch %merge
+%merge = OpLabel
+%color = OpPhi %v4float %color_dead %then %color_else %else %color_dead %dead
+OpStore %out %color
+OpReturn
+OpFunctionEnd
+)");
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%color_dead"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("definition does not dominate its parent"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("%then"));
+}
+
 }  // namespace
 }  // namespace val
 }  // namespace spvtools
