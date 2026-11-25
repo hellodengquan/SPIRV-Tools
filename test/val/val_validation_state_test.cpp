@@ -309,6 +309,393 @@ TEST_F(ValidationStateTest, CheckVulkanIndirectlyRecursiveBodyBad) {
                         " %1 = OpFunction %void Pure|Const %3\n"));
 }
 
+// The following multi-entry call graph tests exercise a shared function
+// library where every entry point reaches a different subgraph. Explicit ids
+// are used so the computed function -> entry-point mapping can be asserted.
+
+// Two entry points of different execution models may legally share the same
+// acyclic helper. Sharing must not be mistaken for recursion.
+TEST_F(ValidationStateTest,
+       VulkanCallGraphSharedAcyclicHelperBetweenEntriesGood) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %10 "frag_main"
+OpEntryPoint Vertex %11 "vert_main"
+OpExecutionMode %10 OriginUpperLeft
+%1 = OpTypeVoid
+%2 = OpTypeFunction %1
+%20 = OpFunction %1 None %2
+%21 = OpLabel
+OpReturn
+OpFunctionEnd
+%10 = OpFunction %1 None %2
+%12 = OpLabel
+%13 = OpFunctionCall %1 %20
+OpReturn
+OpFunctionEnd
+%11 = OpFunction %1 None %2
+%14 = OpLabel
+%15 = OpFunctionCall %1 %20
+OpReturn
+OpFunctionEnd
+)";
+
+  SetAssembleOptions(SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  CompileSuccessfully(spirv, SPV_ENV_VULKAN_1_1);
+  EXPECT_EQ(SPV_SUCCESS,
+            ValidateAndRetrieveValidationState(SPV_ENV_VULKAN_1_1));
+  // The shared helper is reachable from both entry points.
+  EXPECT_EQ((std::vector<uint32_t>{10u, 11u}),
+            vstate_->FunctionEntryPoints(20u));
+  EXPECT_TRUE(vstate_->recursive_entry_points().empty());
+}
+
+// A recursive cycle that is not reachable from any entry point is outside every
+// entry point's static call graph and must be accepted in Vulkan.
+TEST_F(ValidationStateTest,
+       VulkanCallGraphUnreachableRecursiveLibraryFunctionsGood) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %10 "main"
+OpExecutionMode %10 OriginUpperLeft
+%1 = OpTypeVoid
+%2 = OpTypeFunction %1
+%20 = OpFunction %1 None %2
+%21 = OpLabel
+OpReturn
+OpFunctionEnd
+%30 = OpFunction %1 None %2
+%32 = OpLabel
+%33 = OpFunctionCall %1 %31
+OpReturn
+OpFunctionEnd
+%31 = OpFunction %1 None %2
+%34 = OpLabel
+%35 = OpFunctionCall %1 %30
+OpReturn
+OpFunctionEnd
+%10 = OpFunction %1 None %2
+%12 = OpLabel
+%13 = OpFunctionCall %1 %20
+OpReturn
+OpFunctionEnd
+)";
+
+  SetAssembleOptions(SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  CompileSuccessfully(spirv, SPV_ENV_VULKAN_1_1);
+  EXPECT_EQ(SPV_SUCCESS,
+            ValidateAndRetrieveValidationState(SPV_ENV_VULKAN_1_1));
+  EXPECT_TRUE(vstate_->recursive_entry_points().empty());
+  // The dead recursive pair belongs to no entry point.
+  EXPECT_TRUE(vstate_->FunctionEntryPoints(30u).empty());
+  EXPECT_TRUE(vstate_->FunctionEntryPoints(31u).empty());
+}
+
+// Two entries share an acyclic helper, but only one of them additionally
+// reaches a recursive cycle. Vulkan must reject the module and the diagnostic
+// must be anchored on the affected entry point, not the clean one.
+TEST_F(ValidationStateTest,
+       VulkanCallGraphRecursionReachableFromOneEntryNamesThatEntry) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %10 "good_main"
+OpEntryPoint Vertex %11 "bad_main"
+OpExecutionMode %10 OriginUpperLeft
+OpName %10 "good_entry"
+OpName %11 "bad_entry"
+%1 = OpTypeVoid
+%2 = OpTypeFunction %1
+%20 = OpFunction %1 None %2
+%21 = OpLabel
+OpReturn
+OpFunctionEnd
+%30 = OpFunction %1 None %2
+%32 = OpLabel
+%33 = OpFunctionCall %1 %30
+OpReturn
+OpFunctionEnd
+%10 = OpFunction %1 None %2
+%12 = OpLabel
+%13 = OpFunctionCall %1 %20
+OpReturn
+OpFunctionEnd
+%11 = OpFunction %1 None %2
+%14 = OpLabel
+%16 = OpFunctionCall %1 %20
+%15 = OpFunctionCall %1 %30
+OpReturn
+OpFunctionEnd
+)";
+
+  SetAssembleOptions(SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  CompileSuccessfully(spirv, SPV_ENV_VULKAN_1_1);
+  EXPECT_EQ(SPV_ERROR_INVALID_BINARY,
+            ValidateAndRetrieveValidationState(SPV_ENV_VULKAN_1_1));
+  EXPECT_THAT(getDiagnosticString(),
+              AnyVUID("VUID-StandaloneSpirv-None-04634"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Entry points may not have a call graph with cycles."));
+  // The error points at the recursive Vertex entry point.
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("%bad_entry = OpFunction"));
+  EXPECT_THAT(getDiagnosticString(),
+              ::testing::Not(HasSubstr("%good_entry = OpFunction")));
+
+  // Only entry %11 reaches the self recursion.
+  const auto& recursive = vstate_->recursive_entry_points();
+  EXPECT_EQ(1u, recursive.size());
+  EXPECT_NE(recursive.end(), recursive.find(11u));
+  // The shared helper is still reachable from both entries, while the
+  // recursive function is reachable only from the bad entry.
+  EXPECT_EQ((std::vector<uint32_t>{10u, 11u}),
+            vstate_->FunctionEntryPoints(20u));
+  EXPECT_EQ((std::vector<uint32_t>{11u}),
+            vstate_->FunctionEntryPoints(30u));
+}
+
+// When two entry points both reach the same cycle, both are recorded as
+// affected and the emitted diagnostic is anchored on the first one.
+TEST_F(ValidationStateTest,
+       VulkanCallGraphRecursionReachableFromBothEntriesRecordsBoth) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %10 "first_main"
+OpEntryPoint Fragment %11 "second_main"
+OpExecutionMode %10 OriginUpperLeft
+OpExecutionMode %11 OriginUpperLeft
+OpName %10 "first_entry"
+OpName %11 "second_entry"
+%1 = OpTypeVoid
+%2 = OpTypeFunction %1
+%30 = OpFunction %1 None %2
+%32 = OpLabel
+%33 = OpFunctionCall %1 %30
+OpReturn
+OpFunctionEnd
+%10 = OpFunction %1 None %2
+%12 = OpLabel
+%13 = OpFunctionCall %1 %30
+OpReturn
+OpFunctionEnd
+%11 = OpFunction %1 None %2
+%14 = OpLabel
+%15 = OpFunctionCall %1 %30
+OpReturn
+OpFunctionEnd
+)";
+
+  SetAssembleOptions(SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  CompileSuccessfully(spirv, SPV_ENV_VULKAN_1_1);
+  EXPECT_EQ(SPV_ERROR_INVALID_BINARY,
+            ValidateAndRetrieveValidationState(SPV_ENV_VULKAN_1_1));
+  EXPECT_THAT(getDiagnosticString(),
+              AnyVUID("VUID-StandaloneSpirv-None-04634"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("%first_entry = OpFunction"));
+
+  const auto& recursive = vstate_->recursive_entry_points();
+  EXPECT_EQ(2u, recursive.size());
+  EXPECT_NE(recursive.end(), recursive.find(10u));
+  EXPECT_NE(recursive.end(), recursive.find(11u));
+  EXPECT_EQ((std::vector<uint32_t>{10u, 11u}),
+            vstate_->FunctionEntryPoints(30u));
+}
+
+// A stage-restricted instruction (OpDPdx is limited to Fragment/GLCompute/
+// MeshEXT/TaskEXT models) accepted in a Fragment entry through a call chain.
+TEST_F(ValidationStateTest,
+       VulkanCallGraphStageLimitationThroughChainAcceptedForFragment) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpCapability DerivativeControl
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %10 "frag_main"
+OpExecutionMode %10 OriginUpperLeft
+%1 = OpTypeVoid
+%2 = OpTypeFunction %1
+%3 = OpTypeFloat 32
+%20 = OpFunction %1 None %2
+%4 = OpLabel
+%5 = OpUndef %3
+%6 = OpDPdx %3 %5
+OpReturn
+OpFunctionEnd
+%21 = OpFunction %1 None %2
+%7 = OpLabel
+%8 = OpFunctionCall %1 %20
+OpReturn
+OpFunctionEnd
+%10 = OpFunction %1 None %2
+%12 = OpLabel
+%13 = OpFunctionCall %1 %21
+OpReturn
+OpFunctionEnd
+)";
+
+  SetAssembleOptions(SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  CompileSuccessfully(spirv, SPV_ENV_VULKAN_1_1);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_1));
+}
+
+// The same call chain under a Vertex entry propagates the derivative stage
+// restriction back to the entry point and names both the entry and the
+// function that contains the restricted instruction.
+TEST_F(ValidationStateTest,
+       VulkanCallGraphStageLimitationThroughChainRejectedForVertex) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpCapability DerivativeControl
+OpMemoryModel Logical GLSL450
+OpEntryPoint Vertex %11 "vert_main"
+OpName %11 "vert_entry"
+OpName %20 "derivative_helper"
+%1 = OpTypeVoid
+%2 = OpTypeFunction %1
+%3 = OpTypeFloat 32
+%20 = OpFunction %1 None %2
+%4 = OpLabel
+%5 = OpUndef %3
+%6 = OpDPdx %3 %5
+OpReturn
+OpFunctionEnd
+%21 = OpFunction %1 None %2
+%7 = OpLabel
+%8 = OpFunctionCall %1 %20
+OpReturn
+OpFunctionEnd
+%11 = OpFunction %1 None %2
+%14 = OpLabel
+%15 = OpFunctionCall %1 %21
+OpReturn
+OpFunctionEnd
+)";
+
+  SetAssembleOptions(SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  CompileSuccessfully(spirv, SPV_ENV_VULKAN_1_1);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID,
+            ValidateAndRetrieveValidationState(SPV_ENV_VULKAN_1_1));
+  const std::string diag = getDiagnosticString();
+  EXPECT_THAT(diag, HasSubstr("OpEntryPoint Entry Point <id> "));
+  EXPECT_THAT(diag,
+              HasSubstr("[%vert_entry]'s callgraph contains function <id>"));
+  EXPECT_THAT(
+      diag, HasSubstr("[%derivative_helper]', which cannot be used with the "
+                      "current execution model"));
+  EXPECT_THAT(diag,
+              HasSubstr("Derivative instructions require Fragment, GLCompute, "
+                        "MeshEXT or TaskEXT execution model: DPdx"));
+  // The propagation mapping reaches the helper through the intermediate
+  // caller.
+  EXPECT_EQ((std::vector<uint32_t>{11u}),
+            vstate_->FunctionEntryPoints(20u));
+}
+
+// One library chain is shared by a legal Fragment entry and an illegal Vertex
+// entry. The diagnostic must single out the Vertex entry as the affected one
+// even though the Fragment entry reaches the exact same helper.
+TEST_F(ValidationStateTest,
+       VulkanCallGraphStageLimitationNamesAffectedEntryAmongSharedEntries) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpCapability DerivativeControl
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %10 "frag_main"
+OpEntryPoint Vertex %11 "vert_main"
+OpExecutionMode %10 OriginUpperLeft
+OpName %10 "frag_entry"
+OpName %11 "vert_entry"
+OpName %20 "derivative_helper"
+%1 = OpTypeVoid
+%2 = OpTypeFunction %1
+%3 = OpTypeFloat 32
+%20 = OpFunction %1 None %2
+%4 = OpLabel
+%5 = OpUndef %3
+%6 = OpDPdx %3 %5
+OpReturn
+OpFunctionEnd
+%21 = OpFunction %1 None %2
+%7 = OpLabel
+%8 = OpFunctionCall %1 %20
+OpReturn
+OpFunctionEnd
+%10 = OpFunction %1 None %2
+%12 = OpLabel
+%13 = OpFunctionCall %1 %21
+OpReturn
+OpFunctionEnd
+%11 = OpFunction %1 None %2
+%14 = OpLabel
+%15 = OpFunctionCall %1 %21
+OpReturn
+OpFunctionEnd
+)";
+
+  SetAssembleOptions(SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  CompileSuccessfully(spirv, SPV_ENV_VULKAN_1_1);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID,
+            ValidateAndRetrieveValidationState(SPV_ENV_VULKAN_1_1));
+  const std::string diag = getDiagnosticString();
+  EXPECT_THAT(diag,
+              HasSubstr("[%vert_entry]'s callgraph contains function <id>"));
+  EXPECT_THAT(
+      diag, HasSubstr("[%derivative_helper]', which cannot be used with the "
+                      "current execution model"));
+  EXPECT_THAT(diag, ::testing::Not(HasSubstr("[%frag_entry]")));
+  // Both entries do reach the shared helper; the model check distinguishes
+  // them.
+  EXPECT_EQ((std::vector<uint32_t>{10u, 11u}),
+            vstate_->FunctionEntryPoints(20u));
+  EXPECT_EQ((std::vector<uint32_t>{10u, 11u}),
+            vstate_->FunctionEntryPoints(21u));
+}
+
+// Two legal call branches sharing one stage-restricted helper must still be
+// accepted: shared use does not create a cycle or a stage violation.
+TEST_F(ValidationStateTest,
+       VulkanCallGraphTwoLegalBranchesShareStageLimitedHelperGood) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpCapability DerivativeControl
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %10 "main"
+OpExecutionMode %10 OriginUpperLeft
+%1 = OpTypeVoid
+%2 = OpTypeFunction %1
+%3 = OpTypeFloat 32
+%20 = OpFunction %1 None %2
+%4 = OpLabel
+%5 = OpUndef %3
+%6 = OpDPdx %3 %5
+OpReturn
+OpFunctionEnd
+%21 = OpFunction %1 None %2
+%22 = OpLabel
+%23 = OpFunctionCall %1 %20
+OpReturn
+OpFunctionEnd
+%24 = OpFunction %1 None %2
+%25 = OpLabel
+%26 = OpFunctionCall %1 %20
+OpReturn
+OpFunctionEnd
+%10 = OpFunction %1 None %2
+%12 = OpLabel
+%13 = OpFunctionCall %1 %21
+%14 = OpFunctionCall %1 %24
+OpReturn
+OpFunctionEnd
+)";
+
+  SetAssembleOptions(SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  CompileSuccessfully(spirv, SPV_ENV_VULKAN_1_1);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_1));
+}
+
 TEST_F(ValidationStateTest, EvalConstantValWiderThan64BitsIsNotEvaluable) {
   const uint32_t kInt128Id = 1;
   const uint32_t kConstId = 2;
