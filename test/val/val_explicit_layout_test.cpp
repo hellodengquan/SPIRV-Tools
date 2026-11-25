@@ -5624,9 +5624,343 @@ TEST_F(ValidateExplicitLayout, Offset_Unaligned) {
               HasSubstr("Structure member 1 at offset 4 is not aligned to 16"));
 }
 
+// A matrix nested inside a struct which is itself an array element. The
+// matrix's RowMajor/ColMajor and MatrixStride decorations live on a struct
+// member, not on the memory reference type, so the diagnostic has to name the
+// full nesting chain and the byte interval each level occupies.
+TEST_F(ValidateExplicitLayout, NestedMatrixInArrayOfStructBadStride) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %S Block
+OpDecorate %var DescriptorSet 0
+OpDecorate %var Binding 0
+OpDecorate %arr ArrayStride 32
+OpMemberDecorate %S 0 Offset 0
+OpMemberDecorate %S 1 Offset 16
+OpMemberDecorate %Inner 0 Offset 0
+OpMemberDecorate %Inner 0 ColMajor
+OpMemberDecorate %Inner 0 MatrixStride 8
+OpMemberDecorate %Inner 1 Offset 16
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%v2 = OpTypeVector %float 2
+%mat = OpTypeMatrix %v2 2
+%Inner = OpTypeStruct %mat %float
+%arr = OpTypeArray %Inner %uint_2
+%S = OpTypeStruct %float %arr
+%ptr = OpTypePointer Uniform %S
+%var = OpVariable %ptr Uniform
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_VULKAN_1_1));
+  // The innermost rule violation, as before.
+  EXPECT_THAT(
+      getDiagnosticString(),
+      HasSubstr("Matrix with a stride 8 not satisfying alignment to 16"));
+  // The nesting chain, from the outer struct member down to the matrix
+  // member that actually declared the decorations.
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Violation at member 1 of"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("-> element 0 of"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("-> member 0 of"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("ColMajor, MatrixStride 8"));
+  // The byte interval the offending member occupies within the buffer.
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("bytes 16..31"));
+}
+
+// The same nested type is legal under std430 (StorageBuffer) but not std140
+// (Uniform). Each storage class must be checked with its own layout rules, so
+// the legal tight packing has to be accepted for the storage buffer.
+TEST_F(ValidateExplicitLayout, NestedMatrixInArrayOfStructPerStorageClass) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpExtension "SPV_KHR_storage_buffer_storage_class"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %S Block
+OpDecorate %arr_I ArrayStride 16
+OpMemberDecorate %I 0 Offset 0
+OpMemberDecorate %I 0 ColMajor
+OpMemberDecorate %I 0 MatrixStride 8
+OpMemberDecorate %S 0 Offset 0
+OpMemberDecorate %S 1 Offset 32
+OpDecorate %ssbo DescriptorSet 0
+OpDecorate %ssbo Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%v2 = OpTypeVector %float 2
+%mat = OpTypeMatrix %v2 2
+%I = OpTypeStruct %mat
+%arr_I = OpTypeArray %I %uint_2
+%S = OpTypeStruct %arr_I %float
+%ptr_sb = OpTypePointer StorageBuffer %S
+%ssbo = OpVariable %ptr_sb StorageBuffer
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  // std430: a mat2 with MatrixStride 8 and an array stride of 16 is a legal
+  // tight packing for an array of structs in a storage buffer.
+  CompileSuccessfully(spirv);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_1))
+      << getDiagnosticString();
+}
+
+// A storage buffer block containing the same nested array-of-struct as a
+// uniform block is fine under std430; switching it to Uniform must produce the
+// std140 alignment diagnostic instead.
+TEST_F(ValidateExplicitLayout, NestedMatrixInArrayOfStructUniformBad) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %S Block
+OpDecorate %arr_I ArrayStride 16
+OpMemberDecorate %I 0 Offset 0
+OpMemberDecorate %I 0 ColMajor
+OpMemberDecorate %I 0 MatrixStride 8
+OpMemberDecorate %S 0 Offset 0
+OpMemberDecorate %S 1 Offset 32
+OpDecorate %ubo DescriptorSet 0
+OpDecorate %ubo Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%v2 = OpTypeVector %float 2
+%mat = OpTypeMatrix %v2 2
+%I = OpTypeStruct %mat
+%arr_I = OpTypeArray %I %uint_2
+%S = OpTypeStruct %arr_I %float
+%ptr_u = OpTypePointer Uniform %S
+%ubo = OpVariable %ptr_u Uniform
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_VULKAN_1_1));
+  EXPECT_THAT(
+      getDiagnosticString(),
+      HasSubstr("Matrix with a stride 8 not satisfying alignment to 16"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("using extended layout rules"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Violation at member 0 of"));
+}
+
+// An ArrayStride that cannot hold one element: the diagnostic has to report
+// both the byte interval element 0 occupies and where element 1 actually
+// starts, so that the offending declaration is unambiguous.
+TEST_F(ValidateExplicitLayout, ArrayStrideSmallerThanElementByteRange) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %S Block
+OpDecorate %var DescriptorSet 0
+OpDecorate %var Binding 0
+OpDecorate %arr ArrayStride 16
+OpMemberDecorate %S 0 Offset 0
+OpMemberDecorate %S 1 Offset 16
+OpMemberDecorate %Inner 0 Offset 0
+OpMemberDecorate %Inner 0 ColMajor
+OpMemberDecorate %Inner 0 MatrixStride 16
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%v2 = OpTypeVector %float 2
+%mat = OpTypeMatrix %v2 2
+%Inner = OpTypeStruct %mat
+%arr = OpTypeArray %Inner %uint_2
+%S = OpTypeStruct %float %arr
+%ptr = OpTypePointer Uniform %S
+%var = OpVariable %ptr Uniform
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_VULKAN_1_1));
+  EXPECT_THAT(
+      getDiagnosticString(),
+      HasSubstr("Array stride 16 is smaller than element type size 24"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Element 0 occupies bytes 16..39"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("element 1 starts at byte 32"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("declares ArrayStride 16"));
+}
+
+// A non-square matrix stored row-major occupies a different number of bytes
+// than the same matrix stored column-major (24 vs 40 for mat2x3 with
+// MatrixStride 16). The overlap diagnostic must use the extent implied by the
+// declared majorness.
+TEST_F(ValidateExplicitLayout, RowMajorNonSquareMatrixExtent) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpExtension "SPV_KHR_storage_buffer_storage_class"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %S Block
+OpDecorate %var DescriptorSet 0
+OpDecorate %var Binding 0
+OpMemberDecorate %S 0 Offset 0
+OpMemberDecorate %S 0 RowMajor
+OpMemberDecorate %S 0 MatrixStride 16
+OpMemberDecorate %S 1 Offset 24
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v2 = OpTypeVector %float 2
+%mat = OpTypeMatrix %v2 3
+%S = OpTypeStruct %mat %float
+%ptr = OpTypePointer StorageBuffer %S
+%var = OpVariable %ptr StorageBuffer
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  // Row-major mat2x3 with stride 16 occupies 28 bytes, so offset 24 overlaps.
+  CompileSuccessfully(spirv, SPV_ENV_VULKAN_1_1);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_VULKAN_1_1));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Structure member 1 at offset 24 overlaps previous "
+                        "member ending at offset 27"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("the overlapping declaration is member 0"));
+}
+
+// Column-major mat2x3 with MatrixStride 16 occupies 40 bytes, so offset 36
+// overlaps. Companion to RowMajorNonSquareMatrixExtent: same type and stride,
+// different majorness, different extent.
+TEST_F(ValidateExplicitLayout, ColMajorNonSquareMatrixExtent) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpExtension "SPV_KHR_storage_buffer_storage_class"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %S Block
+OpDecorate %var DescriptorSet 0
+OpDecorate %var Binding 0
+OpMemberDecorate %S 0 Offset 0
+OpMemberDecorate %S 0 ColMajor
+OpMemberDecorate %S 0 MatrixStride 16
+OpMemberDecorate %S 1 Offset 36
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v2 = OpTypeVector %float 2
+%mat = OpTypeMatrix %v2 3
+%S = OpTypeStruct %mat %float
+%ptr = OpTypePointer StorageBuffer %S
+%var = OpVariable %ptr StorageBuffer
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_VULKAN_1_1));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Structure member 1 at offset 36 overlaps previous "
+                        "member ending at offset 39"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("the overlapping declaration is member 0"));
+}
+
+// The same struct type is used by both a std430 storage buffer (legal) and a
+// std140 uniform block (illegal). Whichever variable is declared first, the
+// validator has to apply each storage class's own layout rules rather than
+// reusing a conclusion cached from the other usage.
+TEST_F(ValidateExplicitLayout,
+       SharedTypeAcrossStorageClassesIsOrderIndependent) {
+  const std::string declarations = R"(
+OpCapability Shader
+OpExtension "SPV_KHR_storage_buffer_storage_class"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %S Block
+OpDecorate %arr_I ArrayStride 16
+OpMemberDecorate %I 0 Offset 0
+OpMemberDecorate %I 0 ColMajor
+OpMemberDecorate %I 0 MatrixStride 8
+OpMemberDecorate %S 0 Offset 0
+OpMemberDecorate %S 1 Offset 32
+OpDecorate %ubo DescriptorSet 0
+OpDecorate %ubo Binding 0
+OpDecorate %ssbo DescriptorSet 0
+OpDecorate %ssbo Binding 1
+)";
+  const std::string types_and_decorations = R"(
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%v2 = OpTypeVector %float 2
+%mat = OpTypeMatrix %v2 2
+%I = OpTypeStruct %mat
+%arr_I = OpTypeArray %I %uint_2
+%S = OpTypeStruct %arr_I %float
+%ptr_u = OpTypePointer Uniform %S
+%ptr_sb = OpTypePointer StorageBuffer %S
+)";
+  const std::string ubo = "%ubo = OpVariable %ptr_u Uniform\n";
+  const std::string ssbo = "%ssbo = OpVariable %ptr_sb StorageBuffer\n";
+
+  for (const auto& order : {ubo + ssbo, ssbo + ubo}) {
+    // The uniform block is always the invalid usage: std140 requires the mat2
+    // to have MatrixStride 16, not 8.
+    const std::string spirv = declarations + types_and_decorations + order +
+                              R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+    CompileSuccessfully(spirv);
+    EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_VULKAN_1_1))
+        << getDiagnosticString();
+    EXPECT_THAT(
+        getDiagnosticString(),
+        HasSubstr("Matrix with a stride 8 not satisfying alignment to 16"));
+    EXPECT_THAT(getDiagnosticString(), HasSubstr("using extended layout rules"));
+    EXPECT_THAT(getDiagnosticString(), HasSubstr("Violation at member 0 of"));
+  }
+}
+
 using UntypedPointerLayout =
     spvtest::ValidateBase<std::tuple<std::string, std::string>>;
-
 TEST_P(UntypedPointerLayout, BadOffset) {
   const auto sc = std::get<0>(GetParam());
   const auto op = std::get<1>(GetParam());

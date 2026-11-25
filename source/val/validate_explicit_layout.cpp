@@ -92,6 +92,36 @@ struct Impl {
     bool col_major = true;
   };
 
+  // One step in the chain of types leading from the memory reference to the
+  // type currently being checked.  Diagnostics use the whole chain so that a
+  // violation can be attributed to the exact nesting level that introduced it
+  // (a struct member or an array element) instead of only naming the innermost
+  // type.
+  struct NestingStep {
+    // True when the step descends into an array element, false when it
+    // descends into a struct member.
+    bool is_array = false;
+    // The struct or array type containing the member/element.
+    uint32_t container_id = 0;
+    // The struct member index or the array element index.
+    uint32_t index = 0;
+    // Absolute byte offset from the start of the memory reference type.
+    uint32_t begin = 0;
+    // Size in bytes of the member/element, or 0 if it cannot be evaluated.
+    uint32_t size = 0;
+    // False when the size cannot be evaluated (e.g. a runtime array), in
+    // which case the member occupies an open-ended byte interval.
+    bool size_known = true;
+    // True when this member declared the matrix decorations (RowMajor/ColMajor
+    // and MatrixStride) that are being validated. This is the declaration an
+    // engineer has to change when a matrix rule is violated.
+    bool matrix_declared = false;
+    bool col_major = true;
+    uint32_t matrix_stride = 0;
+  };
+
+  using NestingPath = std::vector<NestingStep>;
+
   // Cache valid checks for types that should have no layout.
   std::unordered_set<uint32_t> no_layout_cache_;
 
@@ -643,6 +673,51 @@ struct Impl {
     return 1;
   }
 
+  // Returns true if the size of `type_id` cannot be computed: a runtime array,
+  // an array whose length is a non-constant, or a struct whose last member has
+  // no evaluatable offset. Only types whose size is required to describe a
+  // byte interval use this; it is purely diagnostic.
+  //
+  // Struct member cycles are rejected by other validation passes before this
+  // one runs, so a depth limit only needs to keep a malformed module from
+  // recursing without bound.
+  bool IsUnboundedType(uint32_t type_id) {
+    return IsUnboundedType(type_id, 0);
+  }
+
+  static constexpr uint32_t kMaxTypeWalkDepth = 64;
+
+  bool IsUnboundedType(uint32_t type_id, uint32_t depth) {
+    if (depth > kMaxTypeWalkDepth) {
+      return true;
+    }
+    const auto* type_inst = vstate.FindDef(type_id);
+    switch (type_inst->opcode()) {
+      case spv::Op::OpTypeRuntimeArray:
+        return true;
+      case spv::Op::OpTypeArray: {
+        uint64_t count = 0;
+        if (!vstate.EvalConstantValUint64(type_inst->GetOperandAs<uint32_t>(2u),
+                                          &count)) {
+          return true;
+        }
+        return IsUnboundedType(type_inst->GetOperandAs<uint32_t>(1u),
+                               depth + 1);
+      }
+      case spv::Op::OpTypeStruct: {
+        const auto& members = GetStructMembers(type_id);
+        if (members.empty()) return false;
+        const auto& last = members.back();
+        if (last.offset == std::numeric_limits<uint32_t>::max()) return true;
+        return IsUnboundedType(
+            type_inst->GetOperandAs<uint32_t>(last.index + 1), depth + 1);
+      }
+      default:
+        break;
+    }
+    return false;
+  }
+
   // Returns the size of the given type.
   uint32_t GetSize(uint32_t type_id,
                    const MatrixConstraints& matrix_constraints) {
@@ -818,6 +893,81 @@ struct Impl {
     return str.str();
   }
 
+  // Describes a byte interval "[begin, end]" in the diagnostics. The end is
+  // inclusive so that a member occupying bytes 16..19 is printed as 16..19.
+  // An unevaluatable size (e.g. a runtime array) is reported as an open
+  // interval starting at `begin`.
+  static std::string ByteRange(uint32_t begin, uint32_t size,
+                               bool size_known = true) {
+    std::ostringstream str;
+    str << "bytes " << begin;
+    if (size_known && size != 0) {
+      str << ".." << (begin + size - 1);
+    } else {
+      str << "..";
+    }
+    return str.str();
+  }
+
+  // Renders one nesting step, e.g. "member 0 of 'Inner' (bytes 16..31)" or,
+  // when the member declared the matrix layout, "member 0 of 'Inner'
+  // (ColMajor, MatrixStride 8; bytes 16..31)".
+  std::string DescribeStep(const NestingStep& step) {
+    std::ostringstream str;
+    str << (step.is_array ? "element " : "member ") << step.index << " of "
+        << vstate.getIdName(step.container_id) << " (";
+    if (step.matrix_declared) {
+      str << (step.col_major ? "ColMajor" : "RowMajor") << ", MatrixStride "
+          << step.matrix_stride << "; ";
+    }
+    str << ByteRange(step.begin, step.size, step.size_known) << ")";
+    return str.str();
+  }
+
+  // Renders the chain of nesting steps from the memory reference down to the
+  // innermost type being checked. This tells the engineer exactly which
+  // declared member (and which array element of it, if any) is involved, and
+  // the byte interval each level occupies.
+  std::string DescribePath(const NestingPath& path) {
+    std::ostringstream str;
+    for (size_t i = 0; i < path.size(); ++i) {
+      if (i != 0) {
+        str << " -> ";
+      }
+      str << DescribeStep(path[i]);
+    }
+    return str.str();
+  }
+
+  // Returns the nesting chain as a diagnostic suffix, e.g.
+  //   " Violation at member 1 of 'S' (bytes 16..95) -> element 0 of 'arr'
+  //    (bytes 16..47)."
+  // The last step is the level that violated the rule; earlier steps are the
+  // enclosing declarations. Empty for the memory reference type itself.
+  std::string NestingContext(const NestingPath& path) {
+    if (path.empty()) {
+      return "";
+    }
+    return " Violation at " + DescribePath(path) + ".";
+  }
+
+  // Describes an array declaration and its declared stride, so that an engineer
+  // knows which ArrayStride decoration has to change.
+  std::string ArrayDeclarationHint(uint32_t array_type_id) {
+    const auto [has_stride, stride] = GetArrayStride(array_type_id);
+    std::ostringstream str;
+    str << " Array " << vstate.getIdName(array_type_id) << " ";
+    if (!has_stride) {
+      str << "declares no ArrayStride";
+    } else if (stride == std::numeric_limits<uint32_t>::max()) {
+      str << "declares an ArrayStride that cannot be evaluated";
+    } else {
+      str << "declares ArrayStride " << stride;
+    }
+    str << ".";
+    return str.str();
+  }
+
   // Checks struct layouts
   // * Each member must
   //   * Have an offset decoration
@@ -832,7 +982,8 @@ struct Impl {
   spv_result_t CheckStructLayout(const Instruction* inst, uint32_t type_id,
                                  spv::StorageClass storage_class,
                                  LayoutMode mode, uint32_t incoming_offset,
-                                 const MatrixConstraints& matrix_constraints) {
+                                 const MatrixConstraints& matrix_constraints,
+                                 const NestingPath& path) {
     const auto* type_inst = vstate.FindDef(type_id);
     const auto& member_info = GetStructMembers(type_id);
     for (auto& member : member_info) {
@@ -843,6 +994,7 @@ struct Impl {
                << "Structure member " << member.index
                << " must be explicitly laid out with Offset or OffsetIdEXT "
                   "decorations."
+               << NestingContext(path)
                << CommonError(inst, storage_class, mode);
       }
       if (ContainsMatrix(member_id)) {
@@ -851,12 +1003,14 @@ struct Impl {
                  << "Structure member " << member.index
                  << " containing a matrix must be explicitly laid out "
                     "with RowMajor or ColMajor decorations."
+                 << NestingContext(path)
                  << CommonError(inst, storage_class, mode);
         } else if (member.matrix_constraints.stride == 0) {
           return vstate.diag(SPV_ERROR_INVALID_ID, type_inst)
                  << "Structure member " << member.index
                  << " containing a matrix must be explicitly laid out "
                     "with MatrixStride decorations."
+                 << NestingContext(path)
                  << CommonError(inst, storage_class, mode);
         }
       }
@@ -864,6 +1018,8 @@ struct Impl {
 
     uint32_t next_offset = 0;
     uint32_t ordered_index = 0;
+    // Member that established next_offset; named by the overlap diagnostic.
+    const MemberInfo* previous_member = nullptr;
     for (const auto& member : member_info) {
       auto member_idx = member.index;
       auto offset = member.offset;
@@ -879,6 +1035,7 @@ struct Impl {
                << vstate.VkErrorID(4680)
                << "Structure has a runtime array at offset " << offset
                << ", but other members at larger offsets."
+               << NestingContext(path)
                << CommonError(inst, storage_class, mode);
       }
       ordered_index++;
@@ -887,12 +1044,28 @@ struct Impl {
       if (member.has_matrix) {
         mat_constraints = member.matrix_constraints;
       }
+      // The nesting step for this member, described in absolute bytes from the
+      // start of the memory reference type.
+      NestingStep step;
+      step.is_array = false;
+      step.container_id = type_id;
+      step.index = member_idx;
+      step.begin = incoming_offset + offset;
+      step.size = GetSize(member_id, mat_constraints);
+      step.size_known = !IsUnboundedType(member_id) && step.size != 0;
+      step.matrix_declared = member.has_matrix;
+      step.col_major = mat_constraints.col_major;
+      step.matrix_stride = mat_constraints.stride;
+      NestingPath member_path = path;
+      member_path.push_back(step);
+
       uint32_t align = GetAlign(member_id, mode, mat_constraints);
       if (!IsAlignedTo(offset, align)) {
         return vstate.diag(SPV_ERROR_INVALID_ID, type_inst)
                << vstate.VkErrorID(GetAlignVkErrorId(member_inst->opcode()))
                << "Structure member " << member_idx << " at offset " << offset
                << " is not aligned to " << align << "."
+               << NestingContext(path)
                << CommonError(inst, storage_class, mode);
       }
       if (!IsAlignedTo(offset + incoming_offset, align)) {
@@ -901,6 +1074,7 @@ struct Impl {
                << "Structure member " << member_idx << " at offset " << offset
                << " plus incoming offset " << incoming_offset
                << " is not aligned to " << align << "."
+               << NestingContext(path)
                << CommonError(inst, storage_class, mode);
       }
       if (offset < next_offset) {
@@ -908,6 +1082,12 @@ struct Impl {
                << "Structure member " << member_idx << " at offset " << offset
                << " overlaps previous member ending at offset "
                << next_offset - 1 << "."
+               << " Member " << member_idx << " occupies "
+               << ByteRange(step.begin, step.size)
+               << "; the overlapping declaration is member "
+               << (previous_member ? previous_member->index : member_idx)
+               << " of " << vstate.getIdName(type_id) << "."
+               << NestingContext(path)
                << CommonError(inst, storage_class, mode);
       }
       if (mode != LayoutMode::kScalar && vstate.IsRelaxedBlockLayout()) {
@@ -919,17 +1099,20 @@ struct Impl {
                    << "Structure member " << member_idx
                    << ": Vector has improper straddle due to offset "
                    << incoming_offset + offset << "."
+                   << NestingContext(path)
                    << CommonError(inst, storage_class, mode);
           }
         }
       }
       if (auto error = CheckLayout(inst, member_id, storage_class, mode,
-                                   incoming_offset + offset, mat_constraints)) {
+                                   incoming_offset + offset, mat_constraints,
+                                   member_path)) {
         return error;
       }
 
       uint32_t size = GetSize(member_id, mat_constraints);
       next_offset = size + offset;
+      previous_member = &member;
       if (mode != LayoutMode::kScalar &&
           (member_inst->opcode() == spv::Op::OpTypeArray ||
            member_inst->opcode() == spv::Op::OpTypeStruct)) {
@@ -949,13 +1132,15 @@ struct Impl {
   spv_result_t CheckArrayLayout(const Instruction* inst, uint32_t type_id,
                                 spv::StorageClass storage_class,
                                 LayoutMode mode, uint32_t incoming_offset,
-                                const MatrixConstraints& matrix_constraints) {
+                                const MatrixConstraints& matrix_constraints,
+                                const NestingPath& path) {
     const auto* type_inst = vstate.FindDef(type_id);
     auto [has_stride, stride] = GetArrayStride(type_id);
     if (!has_stride) {
       return vstate.diag(SPV_ERROR_INVALID_ID, type_inst)
              << "Array must be explicitly laid out with ArrayStride or "
                 "ArrayStrideIdEXT decorations."
+             << ArrayDeclarationHint(type_id) << NestingContext(path)
              << CommonError(inst, storage_class, mode);
     }
     uint32_t ele_id = type_inst->GetOperandAs<uint32_t>(1u);
@@ -964,7 +1149,7 @@ struct Impl {
     if (stride == 0) {
       return vstate.diag(SPV_ERROR_INVALID_ID, type_inst)
              << "Array must not have a stride of 0."
-             << CommonError(inst, storage_class, mode);
+             << NestingContext(path) << CommonError(inst, storage_class, mode);
     }
 
     // uint32 max stride is unevaluatable (e.g. spec constant).
@@ -975,12 +1160,20 @@ struct Impl {
     if (!IsAlignedTo(stride, align)) {
       return vstate.diag(SPV_ERROR_INVALID_ID, type_inst)
              << "Array stride " << stride << " must satisfy alignment " << align
-             << "." << CommonError(inst, storage_class, mode);
+             << "." << ArrayDeclarationHint(type_id) << NestingContext(path)
+             << CommonError(inst, storage_class, mode);
     }
     if (stride != std::numeric_limits<uint32_t>::max() && stride < ele_size) {
+      // This is the case where one array element (and therefore every pair of
+      // adjacent elements) overlaps. Report the byte interval each element
+      // occupies so that it is clear which declaration has to change.
       return vstate.diag(SPV_ERROR_INVALID_ID, type_inst)
              << "Array stride " << stride
              << " is smaller than element type size " << ele_size << "."
+             << " Element 0 occupies " << ByteRange(incoming_offset, ele_size)
+             << ", but element 1 starts at byte " << (incoming_offset + stride)
+             << "."
+             << ArrayDeclarationHint(type_id) << NestingContext(path)
              << CommonError(inst, storage_class, mode);
     }
 
@@ -1001,8 +1194,18 @@ struct Impl {
         break;
       }
 
-      if (auto error = CheckLayout(inst, ele_id, storage_class, mode,
-                                   next_offset, matrix_constraints)) {
+      NestingStep step;
+      step.is_array = true;
+      step.container_id = type_id;
+      step.index = i;
+      step.begin = next_offset;
+      step.size = ele_size;
+      step.size_known = !IsUnboundedType(ele_id) && ele_size != 0;
+      NestingPath element_path = path;
+      element_path.push_back(step);
+      if (auto error =
+              CheckLayout(inst, ele_id, storage_class, mode, next_offset,
+                          matrix_constraints, element_path)) {
         return error;
       }
 
@@ -1017,7 +1220,8 @@ struct Impl {
   spv_result_t CheckMatrixLayout(const Instruction* inst, uint32_t type_id,
                                  spv::StorageClass storage_class,
                                  LayoutMode mode,
-                                 const MatrixConstraints& matrix_constraints) {
+                                 const MatrixConstraints& matrix_constraints,
+                                 const NestingPath& path) {
     // We already checked that any struct containing a matrix has a non-zero
     // stride so if we have 0 stride here then it will come from the result
     // of an access chain or other instruction. Other rules are meant to
@@ -1031,7 +1235,8 @@ struct Impl {
       return vstate.diag(SPV_ERROR_INVALID_ID, type_inst)
              << "Matrix with a stride " << matrix_constraints.stride
              << " not satisfying alignment to " << align << "."
-             << CommonError(inst, storage_class, mode) << "\n";
+             << NestingContext(path) << CommonError(inst, storage_class, mode)
+             << "\n";
     }
     const auto ele_id = type_inst->GetOperandAs<uint32_t>(1u);
     uint32_t size = 0;
@@ -1047,7 +1252,7 @@ struct Impl {
       return vstate.diag(SPV_ERROR_INVALID_ID, type_inst)
              << "Matrix stride " << matrix_constraints.stride
              << " is smaller than column size " << size << "."
-             << CommonError(inst, storage_class, mode);
+             << NestingContext(path) << CommonError(inst, storage_class, mode);
     }
     return SPV_SUCCESS;
   }
@@ -1056,7 +1261,8 @@ struct Impl {
   spv_result_t CheckLayout(const Instruction* inst, uint32_t type_id,
                            spv::StorageClass storage_class, LayoutMode mode,
                            uint32_t incoming_offset,
-                           const MatrixConstraints& matrix_constraints) {
+                           const MatrixConstraints& matrix_constraints,
+                           const NestingPath& path) {
     if (vstate.options()->skip_block_layout) {
       return SPV_SUCCESS;
     }
@@ -1069,9 +1275,9 @@ struct Impl {
     const auto* type_inst = vstate.FindDef(type_id);
     switch (type_inst->opcode()) {
       case spv::Op::OpTypeStruct:
-        if (auto error =
-                CheckStructLayout(inst, type_id, storage_class, mode,
-                                  incoming_offset, matrix_constraints)) {
+        if (auto error = CheckStructLayout(inst, type_id, storage_class, mode,
+                                           incoming_offset, matrix_constraints,
+                                           path)) {
           return error;
         }
         break;
@@ -1079,13 +1285,13 @@ struct Impl {
       case spv::Op::OpTypeRuntimeArray:
         if (auto error =
                 CheckArrayLayout(inst, type_id, storage_class, mode,
-                                 incoming_offset, matrix_constraints)) {
+                                 incoming_offset, matrix_constraints, path)) {
           return error;
         }
         break;
       case spv::Op::OpTypeMatrix:
         if (auto error = CheckMatrixLayout(inst, type_id, storage_class, mode,
-                                           matrix_constraints)) {
+                                           matrix_constraints, path)) {
           return error;
         }
         break;
@@ -1162,7 +1368,7 @@ struct Impl {
         }
         if (auto error =
                 CheckLayout(&inst, reference.type_id, reference.storage_class,
-                            reference.layout, 0, {})) {
+                            reference.layout, 0, {}, {})) {
           return error;
         }
       } else if (reference.requirement == LayoutRequirement::kProhibited) {
