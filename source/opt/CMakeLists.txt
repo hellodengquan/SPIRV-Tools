@@ -113,6 +113,7 @@ set(SPIRV_TOOLS_OPT_SOURCES
   remove_dontinline_pass.h
   remove_duplicates_pass.h
   remove_unused_interface_variables_pass.h
+  rename_debug_source_pass.h
   replace_desc_array_access_using_var_index.h
   replace_invalid_opc.h
   resolve_binding_conflicts_pass.h
@@ -237,6 +238,7 @@ set(SPIRV_TOOLS_OPT_SOURCES
   remove_dontinline_pass.cpp
   remove_duplicates_pass.cpp
   remove_unused_interface_variables_pass.cpp
+  rename_debug_source_pass.cpp
   replace_desc_array_access_using_var_index.cpp
   replace_invalid_opc.cpp
   resolve_binding_conflicts_pass.cpp

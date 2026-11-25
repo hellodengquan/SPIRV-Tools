@@ -16,8 +16,11 @@
 #include "source/opt/debug_info_manager.h"
 
 #include <cassert>
+#include <unordered_set>
+#include <vector>
 
 #include "source/opt/ir_context.h"
+#include "source/util/string_utils.h"
 
 // Constants for OpenCL.DebugInfo.100 & NonSemantic.Shader.DebugInfo
 // extension instructions.
@@ -74,6 +77,31 @@ uint32_t GetInlinedOperand(Instruction* dbg_inlined_at) {
 bool IsEmptyDebugExpression(Instruction* instr) {
   return (instr->GetCommonDebugOpcode() == CommonDebugInfoDebugExpression) &&
          instr->NumOperands() == kDebugExpressOperandOperationIndex;
+}
+
+// Returns true if operand |operand_index| of |inst| is the file-name operand
+// that denotes a debug source path. These are the only positions at which an
+// OpString id represents a source file name:
+//   OpLine   : File is absolute operand 0.
+//   OpSource : operands are Language(0), Version(1), File(2)[, Source(3)].
+//   DebugSource (OpenCL.DebugInfo.100 / NonSemantic.Shader.DebugInfo.100):
+//              OpExtInst operands are result type(0), result id(1), set(2),
+//              ext-inst index(3), File(4)[, Text(5)].
+// Every other use of the same OpString id is a non-path use and must keep
+// observing the original string when source names are remapped.
+bool IsDebugSourceFileUse(Instruction* inst, uint32_t operand_index) {
+  switch (inst->opcode()) {
+    case spv::Op::OpLine:
+      return operand_index == 0;
+    case spv::Op::OpSource:
+      return operand_index == 2;
+    case spv::Op::OpExtInst:
+    case spv::Op::OpExtInstWithForwardRefsKHR:
+      return operand_index == 4 &&
+             inst->GetCommonDebugOpcode() == CommonDebugInfoDebugSource;
+    default:
+      return false;
+  }
 }
 
 }  // namespace
@@ -970,6 +998,107 @@ void DebugInfoManager::ClearDebugInfo(Instruction* instr) {
       }
     }
   }
+}
+
+bool DebugInfoManager::RenameDebugSourceNames(
+    const DebugSourceNameMap& source_name_map) {
+  if (source_name_map.empty()) return false;
+
+  auto* ir_context = context();
+  auto* def_use_mgr = ir_context->get_def_use_mgr();
+  bool changed = false;
+
+  // Collect the OpString instructions first: renaming a shared string inserts
+  // a new OpString into the same debug-1 instruction list, and that insertion
+  // must not perturb this iteration.
+  std::vector<Instruction*> string_insts;
+  for (Instruction& inst : ir_context->module()->debugs1()) {
+    if (inst.opcode() == spv::Op::OpString) string_insts.push_back(&inst);
+  }
+
+  for (Instruction* string_inst : string_insts) {
+    const std::string old_name = string_inst->GetInOperand(0).AsString();
+    auto mapping = source_name_map.find(old_name);
+    if (mapping == source_name_map.end()) continue;
+    const std::string& new_name = mapping->second;
+    if (new_name == old_name) continue;
+
+    const uint32_t string_id = string_inst->result_id();
+
+    struct UseSite {
+      Instruction* inst;
+      uint32_t operand_index;
+    };
+    std::vector<UseSite> use_sites;
+    def_use_mgr->ForEachUse(
+        string_id, [&use_sites](Instruction* user, uint32_t operand_index) {
+          use_sites.push_back({user, operand_index});
+        });
+
+    std::vector<UseSite> path_uses;
+    bool has_non_path_use = false;
+    for (const UseSite& site : use_sites) {
+      if (IsDebugSourceFileUse(site.inst, site.operand_index)) {
+        path_uses.push_back(site);
+      } else {
+        has_non_path_use = true;
+      }
+    }
+
+    if (!has_non_path_use) {
+      // Every use is as a source file path (or the string is unused). Rewrite
+      // the inline string in place. Keeping the same result id preserves all
+      // OpLine file links, DebugSource/DebugLine links and DebugInlinedAt
+      // chains. The operand re-encoding adjusts the instruction word count
+      // for names whose length crosses a 4-byte boundary.
+      string_inst->SetInOperandAsString(0, new_name);
+      changed = true;
+      continue;
+    }
+
+    if (path_uses.empty()) {
+      // The name only survives in non-path operands (a type/variable name,
+      // source text, ...). It is not a debug source file reference, so the
+      // mapping must not alter this (possibly entry-point-visible) string.
+      continue;
+    }
+
+    // The same OpString id also serves a non-path purpose (a type/variable
+    // name, source text, a non-debug extension operand, ...). Keep the
+    // original OpString alive for those users and create a dedicated
+    // OpString carrying the new path for the source-file uses only.
+    const uint32_t new_string_id = ir_context->TakeNextId();
+    if (new_string_id == 0) {
+      // ID overflow has already been reported through the consumer.
+      return changed;
+    }
+
+    std::unique_ptr<Instruction> new_string_inst(
+        new Instruction(ir_context, spv::Op::OpString, /*type_id=*/0,
+                        new_string_id,
+                        Instruction::OperandList{{Operand{
+                            SPV_OPERAND_TYPE_LITERAL_STRING,
+                            utils::MakeVector<Operand::OperandData>(
+                                new_name)}}}));
+    Instruction* new_string =
+        string_inst->InsertBefore(std::move(new_string_inst));
+    def_use_mgr->AnalyzeInstDefUse(new_string);
+
+    std::unordered_set<Instruction*> updated_users;
+    for (const UseSite& site : path_uses) {
+      site.inst->SetOperand(site.operand_index, {new_string_id});
+      updated_users.insert(site.inst);
+    }
+    for (Instruction* user : updated_users) {
+      // Rebuilds the def-use records from the current operands, erasing the
+      // records that referenced the old OpString id first.
+      def_use_mgr->AnalyzeInstUse(user);
+    }
+
+    changed = true;
+  }
+
+  return changed;
 }
 
 }  // namespace analysis

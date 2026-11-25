@@ -552,6 +552,14 @@ Options (in lexicographical order):)",
   --strip-debug
                Remove all debug instructions.)");
   printf(R"(
+  --rename-debug-source=<old path>::<new path>
+               Rename the debug source file name <old path> to <new path>.
+               OpSource/OpLine file references and DebugSource file operands
+               are updated while line numbers and inlining chains stay valid.
+               May be specified multiple times. Non-path uses of the same
+               OpString id and unrelated strings (e.g. entry point names) are
+               preserved.)");
+  printf(R"(
   --strip-nonsemantic
                Remove all reflection and nonsemantic information.)");
   printf(R"(

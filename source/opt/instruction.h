@@ -308,6 +308,15 @@ class Instruction : public utils::IntrusiveNodeBase<Instruction> {
   inline void SetOperand(uint32_t index, Operand::OperandData&& data);
   // Replace all of the in operands with those in |new_operands|.
   inline void SetInOperands(OperandList&& new_operands);
+  // Replaces the literal string carried by in-operand |index| with |value|.
+  // The new string is encoded together with its terminating NUL byte and the
+  // operand's word count is adjusted to match, so |value| may have any
+  // length, including lengths that cross a 4-byte SPIR-V word boundary.
+  // The operand must have type SPV_OPERAND_TYPE_LITERAL_STRING.
+  void SetInOperandAsString(uint32_t index, const std::string& value);
+  // Same as |SetInOperandAsString| but |index| is an absolute operand index
+  // (counting the result type id and result id operands, if present).
+  void SetOperandAsString(uint32_t index, const std::string& value);
   // Sets the result type id.
   inline void SetResultType(uint32_t ty_id);
   inline bool HasResultType() const { return has_type_id_; }

@@ -323,6 +323,22 @@ bool Optimizer::RegisterPassFromFlag(const std::string& flag,
   // can be invoked without creating a pass instance.
   if (pass_name == "strip-debug") {
     RegisterPass(CreateStripDebugInfoPass());
+  } else if (pass_name == "rename-debug-source") {
+    // Argument form: <old-path>::<new-path>. The separator is a double colon
+    // so single colons in paths (e.g. Windows drive letters) are preserved.
+    const size_t separator = pass_args.find("::");
+    if (separator == std::string::npos || separator == 0 ||
+        separator + 2 >= pass_args.size()) {
+      Errorf(consumer(), nullptr, {},
+             "Invalid argument for --rename-debug-source: '%s'. Expected "
+             "'<old source path>::<new source path>'.",
+             pass_args.c_str());
+      return false;
+    }
+    std::unordered_map<std::string, std::string> source_name_map;
+    source_name_map.emplace(pass_args.substr(0, separator),
+                            pass_args.substr(separator + 2));
+    RegisterPass(CreateRenameDebugSourcePass(std::move(source_name_map)));
   } else if (pass_name == "strip-reflect") {
     RegisterPass(CreateStripReflectInfoPass());
   } else if (pass_name == "strip-nonsemantic") {
@@ -796,6 +812,12 @@ Optimizer::PassToken CreateNullPass() {
 Optimizer::PassToken CreateStripDebugInfoPass() {
   return MakeUnique<Optimizer::PassToken::Impl>(
       MakeUnique<opt::StripDebugInfoPass>());
+}
+
+Optimizer::PassToken CreateRenameDebugSourcePass(
+    std::unordered_map<std::string, std::string> source_name_map) {
+  return MakeUnique<Optimizer::PassToken::Impl>(
+      MakeUnique<opt::RenameDebugSourcePass>(std::move(source_name_map)));
 }
 
 Optimizer::PassToken CreateStripReflectInfoPass() {

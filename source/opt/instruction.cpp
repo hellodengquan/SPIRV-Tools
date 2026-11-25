@@ -224,6 +224,24 @@ void Instruction::ReplaceOperands(const OperandList& new_operands) {
   operands_.insert(operands_.begin(), new_operands.begin(), new_operands.end());
 }
 
+void Instruction::SetOperandAsString(uint32_t index,
+                                     const std::string& value) {
+  assert(index < operands_.size() && "operand index out of bound");
+  assert(operands_[index].type == SPV_OPERAND_TYPE_LITERAL_STRING &&
+         "operand is not a literal string");
+  // Re-encoding the string (including its terminating NUL) recomputes the
+  // number of SPIR-V words. SPIR-V strings are inline in the instruction and
+  // have no separate offset table, so this is all that is needed for a name
+  // change whose length changes the instruction size. ToBinary() derives the
+  // instruction word count from the operand word vectors.
+  operands_[index].words = utils::MakeVector<Operand::OperandData>(value);
+}
+
+void Instruction::SetInOperandAsString(uint32_t index,
+                                       const std::string& value) {
+  SetOperandAsString(index + TypeResultIdCount(), value);
+}
+
 bool Instruction::IsReadOnlyLoad() const {
   if (IsLoad()) {
     Instruction* address_def = GetBaseAddress();

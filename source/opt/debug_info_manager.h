@@ -26,6 +26,12 @@ namespace spvtools {
 namespace opt {
 namespace analysis {
 
+// Mapping from a debug source name as it currently appears in the module
+// (the "original" path, used as key) to the name it should be renamed to
+// (e.g. the long/relocated path). See
+// DebugInfoManager::RenameDebugSourceNames.
+using DebugSourceNameMap = std::unordered_map<std::string, std::string>;
+
 // When an instruction of a callee function is inlined to its caller function,
 // we need the line and the scope information of the function call instruction
 // to generate DebugInlinedAt. This class keeps the data. For multiple inlining
@@ -187,6 +193,25 @@ class DebugInfoManager {
   // Removes uses of DebugScope |inst| from |scope_id_to_users_| or uses of
   // DebugInlinedAt |inst| from |inlinedat_id_to_users_|.
   void ClearDebugScopeAndInlinedAtUses(Instruction* inst);
+
+  // Applies |source_name_map| to the file names of every debug source in the
+  // module. The keys are the source names (paths) currently stored in the
+  // module and the values are the replacement names; names not present as a
+  // key are left untouched. Both the legacy form (the OpString referenced by
+  // OpSource File and by OpLine File operands) and the extended debug info
+  // form (the File operand of DebugSource instructions) are handled.
+  //
+  // Line numbers, OpLine/DebugLine references to their files/sources and the
+  // DebugInlinedAt chains are not modified, so per-line and inlining
+  // correspondence is preserved. When an OpString holding a source name is
+  // also used by a non-source operand, the original OpString is kept for
+  // those users and a new OpString carrying the replacement name is created
+  // for just the source-file uses; unrelated strings (entry point names,
+  // OpName values, inline literals, source text operands, ...) are never
+  // rewritten.
+  //
+  // Returns true if at least one source name was changed.
+  bool RenameDebugSourceNames(const DebugSourceNameMap& source_name_map);
 
  private:
   IRContext* context() { return context_; }

@@ -77,6 +77,7 @@
 #include "source/opt/remove_dontinline_pass.h"
 #include "source/opt/remove_duplicates_pass.h"
 #include "source/opt/remove_unused_interface_variables_pass.h"
+#include "source/opt/rename_debug_source_pass.h"
 #include "source/opt/replace_desc_array_access_using_var_index.h"
 #include "source/opt/replace_invalid_opc.h"
 #include "source/opt/resolve_binding_conflicts_pass.h"

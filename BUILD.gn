@@ -628,6 +628,8 @@ static_library("spvtools_opt") {
     "source/opt/remove_duplicates_pass.h",
     "source/opt/remove_unused_interface_variables_pass.cpp",
     "source/opt/remove_unused_interface_variables_pass.h",
+    "source/opt/rename_debug_source_pass.cpp",
+    "source/opt/rename_debug_source_pass.h",
     "source/opt/canonicalize_ids_pass.h",
     "source/opt/canonicalize_ids_pass.cpp",
     "source/opt/replace_desc_array_access_using_var_index.cpp",

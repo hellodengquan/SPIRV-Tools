@@ -21,6 +21,7 @@
 #include "source/opt/build_module.h"
 #include "source/opt/instruction.h"
 #include "spirv-tools/libspirv.hpp"
+#include "spirv-tools/optimizer.hpp"
 
 // Constants for OpenCL.DebugInfo.100 extension instructions.
 
@@ -911,6 +912,368 @@ TEST(DebugInfoManagerTest, DebugInstructionWithForwardRefsKHR) {
 
   EXPECT_EQ(forward_ref_inst->GetCommonDebugOpcode(),
             CommonDebugInfoDebugTypeFunction);
+}
+
+// Finds the single OpString instruction whose decoded text is |text|.
+Instruction* FindStringByText(IRContext* context, const std::string& text) {
+  Instruction* result = nullptr;
+  for (Instruction& inst : context->module()->debugs1()) {
+    if (inst.opcode() != spv::Op::OpString) continue;
+    if (inst.GetInOperand(0).AsString() != text) continue;
+    EXPECT_EQ(nullptr, result) << "more than one OpString with text " << text;
+    result = &inst;
+  }
+  return result;
+}
+
+// Serializes |context|, reparses the binary into a fresh context and checks
+// it with the validator. Returns the reparsed context.
+std::unique_ptr<IRContext> RoundTripAndValidate(
+    IRContext* context, spv_target_env env = SPV_ENV_UNIVERSAL_1_3) {
+  std::vector<uint32_t> binary;
+  context->module()->ToBinary(&binary, /*skip_nop=*/false);
+
+  spvtools::SpirvTools tools(env);
+  tools.SetMessageConsumer([](spv_message_level_t, const char*,
+                              const spv_position_t&, const char* m) {
+    ADD_FAILURE() << m;
+  });
+  EXPECT_TRUE(tools.Validate(binary));
+
+  auto reparsed = BuildModule(env, nullptr, binary.data(), binary.size());
+  EXPECT_NE(nullptr, reparsed);
+  return reparsed;
+}
+
+// Checks the raw binary encoding of the OpString instruction defining |id|:
+// its word count must be 1 (wordcount/opcode) + 1 (result id) plus the exact
+// number of words needed for |expected_text| plus its NUL terminator, and
+// the instruction immediately following it must have opcode |next_opcode|.
+void ExpectStringBinaryEncoding(const std::vector<uint32_t>& binary,
+                                uint32_t id, const std::string& expected_text,
+                                uint32_t next_opcode) {
+  ASSERT_GE(binary.size(), 5u);
+  size_t pos = 5;  // Skip the 5-word SPIR-V header.
+  bool found = false;
+  while (pos < binary.size()) {
+    const uint32_t first_word = binary[pos];
+    const uint32_t word_count = first_word >> 16;
+    const uint32_t opcode = first_word & 0xFFFFu;
+    ASSERT_GE(word_count, 1u);
+    ASSERT_LE(pos + word_count, binary.size());
+    if (opcode == static_cast<uint32_t>(spv::Op::OpString) &&
+        word_count >= 2 && binary[pos + 1] == id) {
+      const size_t string_word_count =
+          (expected_text.size() + 1 + 3) / 4;  // bytes plus NUL, rounded up.
+      EXPECT_EQ(word_count, 2u + string_word_count);
+      std::string decoded;
+      for (size_t w = 2; w < word_count; ++w) {
+        uint32_t word = binary[pos + w];
+        for (int b = 0; b < 4; ++b) {
+          char c = static_cast<char>((word >> (8 * b)) & 0xFFu);
+          if (c == '\0') break;
+          decoded.push_back(c);
+        }
+      }
+      EXPECT_EQ(decoded, expected_text);
+      // The next encoded instruction must start exactly here and carry the
+      // expected opcode, proving the changed instruction length did not
+      // shift subsequent instructions.
+      ASSERT_LT(pos + word_count, binary.size());
+      EXPECT_EQ(binary[pos + word_count] & 0xFFFFu, next_opcode);
+      found = true;
+    }
+    pos += word_count;
+  }
+  EXPECT_TRUE(found) << "OpString id " << id << " not found in binary";
+  EXPECT_EQ(pos, binary.size()) << "instruction stream not consumed exactly";
+}
+
+const char* kLegacySourceText = R"(
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "PSMain"
+               OpExecutionMode %main OriginUpperLeft
+          %5 = OpString "a.hlsl"
+               OpSource HLSL 600 %5
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+       %main = OpFunction %void None %3
+          %6 = OpLabel
+               OpLine %5 42 7
+               OpReturn
+               OpFunctionEnd
+)";
+
+TEST(DebugInfoManager, RenameDebugSourceNamesLegacyInPlace) {
+  auto context = BuildModule(SPV_ENV_UNIVERSAL_1_3, nullptr, kLegacySourceText,
+                             SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  ASSERT_NE(nullptr, context);
+  DebugInfoManager manager(context.get());
+
+  const std::string long_name =
+      "/Volumes/work/build-agent-07/long-sandbox/materials/ps_main.slang";
+  DebugSourceNameMap map = {{"a.hlsl", long_name}};
+  EXPECT_TRUE(manager.RenameDebugSourceNames(map));
+
+  // The same OpString id must now carry the long path (in-place update).
+  Instruction* str = context->get_def_use_mgr()->GetDef(5);
+  ASSERT_NE(nullptr, str);
+  EXPECT_EQ(str->opcode(), spv::Op::OpString);
+  EXPECT_EQ(str->GetInOperand(0).AsString(), long_name);
+
+  // OpSource File operand still references id 5.
+  Instruction* op_source = nullptr;
+  for (Instruction& inst : context->module()->debugs1()) {
+    if (inst.opcode() == spv::Op::OpSource) op_source = &inst;
+  }
+  ASSERT_NE(nullptr, op_source);
+  EXPECT_EQ(op_source->GetSingleWordOperand(2), 5u);
+
+  // OpLine keeps the same file id together with its line and column.
+  bool found_line = false;
+  context->module()->ForEachInst(
+      [&](Instruction* inst) {
+        if (inst->opcode() != spv::Op::OpLine) return;
+        found_line = true;
+        EXPECT_EQ(inst->GetSingleWordOperand(0), 5u);
+        EXPECT_EQ(inst->GetSingleWordOperand(1), 42u);
+        EXPECT_EQ(inst->GetSingleWordOperand(2), 7u);
+      },
+      /*run_on_debug_line_insts=*/true);
+  EXPECT_TRUE(found_line);
+
+  // The entry point name is an inline literal and must be unchanged.
+  for (Instruction& ep : context->module()->entry_points()) {
+    // Operands: execution model, function id, then the name literal.
+    EXPECT_EQ(ep.GetInOperand(2).AsString(), std::string("PSMain"));
+  }
+
+  std::vector<uint32_t> binary;
+  context->module()->ToBinary(&binary, false);
+  ExpectStringBinaryEncoding(binary, 5, long_name,
+                             static_cast<uint32_t>(spv::Op::OpSource));
+
+  auto reparsed = RoundTripAndValidate(context.get());
+  ASSERT_NE(nullptr, reparsed);
+  Instruction* reparsed_str = reparsed->get_def_use_mgr()->GetDef(5);
+  ASSERT_NE(nullptr, reparsed_str);
+  EXPECT_EQ(reparsed_str->GetInOperand(0).AsString(), long_name);
+}
+
+// Names whose length crosses the 4-byte word boundary must re-encode to the
+// exact computed number of words without disturbing the next instruction.
+TEST(DebugInfoManager, RenameDebugSourceNamesWordBoundaries) {
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {"abc", "abcd"},    // 3 -> 4 chars: 1 -> 2 string words.
+      {"abcd", "abc"},    // 4 -> 3 chars: 2 -> 1 string words.
+      {"ab", "abcde"},    // 2 -> 5 chars.
+      {"a", "abcdefgh"},  // 1 -> 8 chars (NUL exactly fills a word).
+  };
+  for (const auto& pair : cases) {
+    const std::string& old_name = pair.first;
+    const std::string& new_name = pair.second;
+    std::string text = kLegacySourceText;
+    text.replace(text.find("a.hlsl"), std::string("a.hlsl").size(), old_name);
+
+    auto context = BuildModule(SPV_ENV_UNIVERSAL_1_3, nullptr, text,
+                               SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+    ASSERT_NE(nullptr, context) << old_name;
+    DebugInfoManager manager(context.get());
+    DebugSourceNameMap map = {{old_name, new_name}};
+    EXPECT_TRUE(manager.RenameDebugSourceNames(map));
+
+    std::vector<uint32_t> binary;
+    context->module()->ToBinary(&binary, false);
+    ExpectStringBinaryEncoding(
+        binary, 5, new_name, static_cast<uint32_t>(spv::Op::OpSource));
+    EXPECT_NE(nullptr, RoundTripAndValidate(context.get()));
+  }
+}
+
+TEST(DebugInfoManager, RenameDebugSourceNamesNoMatchIsNoChange) {
+  auto context = BuildModule(SPV_ENV_UNIVERSAL_1_3, nullptr, kLegacySourceText,
+                             SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  ASSERT_NE(nullptr, context);
+  DebugInfoManager manager(context.get());
+  DebugSourceNameMap map = {{"different/path.spv", "another/path.spv"}};
+  EXPECT_FALSE(manager.RenameDebugSourceNames(map));
+  Instruction* str = context->get_def_use_mgr()->GetDef(5);
+  ASSERT_NE(nullptr, str);
+  EXPECT_EQ(str->GetInOperand(0).AsString(), "a.hlsl");
+}
+
+const char* kSharedStringDebugInfoText = R"(
+               OpCapability Shader
+          %1 = OpExtInstImport "OpenCL.DebugInfo.100"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "PSMain" %in_var_COLOR
+               OpExecutionMode %main OriginUpperLeft
+          %5 = OpString "ps.hlsl"
+         %14 = OpString "#line text"
+         %21 = OpString "main"
+               OpName %in_var_COLOR "in_var_COLOR"
+               OpName %main "main"
+               OpDecorate %in_var_COLOR Location 0
+       %uint = OpTypeInt 32 0
+    %uint_32 = OpConstant %uint 32
+      %float = OpTypeFloat 32
+%_ptr_Input_float = OpTypePointer Input %float
+       %void = OpTypeVoid
+         %27 = OpTypeFunction %void
+%in_var_COLOR = OpVariable %_ptr_Input_float Input
+         %13 = OpExtInst %void %1 DebugExpression
+         %15 = OpExtInst %void %1 DebugSource %5 %14
+         %16 = OpExtInst %void %1 DebugCompilationUnit 1 4 %15 HLSL
+         %18 = OpExtInst %void %1 DebugTypeBasic %5 %uint_32 Float
+         %20 = OpExtInst %void %1 DebugTypeFunction FlagIsProtected|FlagIsPrivate %18 %18
+         %22 = OpExtInst %void %1 DebugFunction %21 %20 %15 1 1 %16 %21 FlagIsProtected|FlagIsPrivate 1 %main
+        %100 = OpExtInst %void %1 DebugInlinedAt 7 %22
+       %main = OpFunction %void None %27
+         %28 = OpLabel
+               OpLine %5 123 4
+         %31 = OpLoad %float %in_var_COLOR
+               OpReturn
+               OpFunctionEnd
+)";
+
+TEST(DebugInfoManager, RenameDebugSourceNamesSplitsSharedString) {
+  auto context =
+      BuildModule(SPV_ENV_UNIVERSAL_1_3, nullptr, kSharedStringDebugInfoText,
+                  SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  ASSERT_NE(nullptr, context);
+  DebugInfoManager manager(context.get());
+
+  const std::string long_name =
+      "/Volumes/work/build-agent-07/deep/sandbox/materials/ps_generated.hlsl";
+  EXPECT_TRUE(manager.RenameDebugSourceNames(
+      DebugSourceNameMap{{"ps.hlsl", long_name}}));
+
+  // The original OpString survives unchanged for the non-path use.
+  Instruction* old_str = context->get_def_use_mgr()->GetDef(5);
+  ASSERT_NE(nullptr, old_str);
+  EXPECT_EQ(old_str->GetInOperand(0).AsString(), "ps.hlsl");
+
+  // A new OpString carries the long path.
+  Instruction* new_str = FindStringByText(context.get(), long_name);
+  ASSERT_NE(nullptr, new_str);
+  const uint32_t new_id = new_str->result_id();
+  EXPECT_NE(new_id, 5u);
+
+  // DebugSource File (absolute operand 4) uses the new id.
+  Instruction* debug_source = context->get_def_use_mgr()->GetDef(15);
+  ASSERT_NE(nullptr, debug_source);
+  EXPECT_EQ(debug_source->GetSingleWordOperand(4), new_id);
+  // Its Text operand is untouched.
+  EXPECT_EQ(debug_source->GetSingleWordOperand(5), 14u);
+
+  // The non-path use (DebugTypeBasic Name, also absolute operand 4) keeps 5.
+  Instruction* debug_basic = context->get_def_use_mgr()->GetDef(18);
+  ASSERT_NE(nullptr, debug_basic);
+  EXPECT_EQ(debug_basic->GetSingleWordOperand(4), 5u);
+
+  // OpLine File moved to the new id; line/column are preserved.
+  bool found_line = false;
+  context->module()->ForEachInst(
+      [&](Instruction* inst) {
+        if (inst->opcode() != spv::Op::OpLine) return;
+        found_line = true;
+        EXPECT_EQ(inst->GetSingleWordOperand(0), new_id);
+        EXPECT_EQ(inst->GetSingleWordOperand(1), 123u);
+        EXPECT_EQ(inst->GetSingleWordOperand(2), 4u);
+      },
+      true);
+  EXPECT_TRUE(found_line);
+
+  // The inlining chain is untouched: DebugInlinedAt still uses line 7 and
+  // scope 22.
+  Instruction* inlined_at = context->get_def_use_mgr()->GetDef(100);
+  ASSERT_NE(nullptr, inlined_at);
+  EXPECT_EQ(inlined_at->GetSingleWordOperand(4), 7u);
+  EXPECT_EQ(inlined_at->GetSingleWordOperand(5), 22u);
+
+  // Entry point name and OpName strings keep their original meaning.
+  for (Instruction& ep : context->module()->entry_points()) {
+    EXPECT_EQ(ep.GetInOperand(2).AsString(), std::string("PSMain"));
+  }
+  EXPECT_NE(FindStringByText(context.get(), "main"), nullptr);
+
+  // DefUse must still be consistent after retargeting operands.
+  EXPECT_TRUE(context->IsConsistent());
+
+  auto reparsed = RoundTripAndValidate(context.get());
+  ASSERT_NE(nullptr, reparsed);
+  // After reparse both strings exist and the DebugSource still references
+  // the long one.
+  EXPECT_NE(FindStringByText(reparsed.get(), "ps.hlsl"), nullptr);
+  EXPECT_NE(FindStringByText(reparsed.get(), long_name), nullptr);
+}
+
+const char* kNonPathOnlyStringText = R"(
+               OpCapability Shader
+          %1 = OpExtInstImport "OpenCL.DebugInfo.100"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "PSMain"
+               OpExecutionMode %main OriginUpperLeft
+          %5 = OpString "type_name_that_looks_like_a_path.hlsl"
+          %7 = OpString "actual_source.hlsl"
+       %uint = OpTypeInt 32 0
+    %uint_32 = OpConstant %uint 32
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+         %15 = OpExtInst %void %1 DebugSource %7
+         %18 = OpExtInst %void %1 DebugTypeBasic %5 %uint_32 Float
+       %main = OpFunction %void None %3
+          %6 = OpLabel
+               OpReturn
+               OpFunctionEnd
+)";
+
+TEST(DebugInfoManager, RenameDebugSourceNamesLeavesNonPathOnlyString) {
+  auto context =
+      BuildModule(SPV_ENV_UNIVERSAL_1_3, nullptr, kNonPathOnlyStringText,
+                  SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  ASSERT_NE(nullptr, context);
+  DebugInfoManager manager(context.get());
+
+  // The key matches the OpString used only as a DebugTypeBasic Name, never as
+  // a source file. It must not be renamed or split.
+  EXPECT_FALSE(manager.RenameDebugSourceNames(DebugSourceNameMap{
+      {"type_name_that_looks_like_a_path.hlsl", "/new/name.hlsl"}}));
+
+  Instruction* name_str = context->get_def_use_mgr()->GetDef(5);
+  ASSERT_NE(nullptr, name_str);
+  EXPECT_EQ(name_str->GetInOperand(0).AsString(),
+            "type_name_that_looks_like_a_path.hlsl");
+  EXPECT_EQ(FindStringByText(context.get(), "/new/name.hlsl"), nullptr);
+  EXPECT_NE(context->get_def_use_mgr()->GetDef(7), nullptr);
+}
+
+TEST(DebugInfoManager, RenameDebugSourcePassThroughOptimizer) {
+  spvtools::SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> binary;
+  ASSERT_TRUE(tools.Assemble(kLegacySourceText, &binary,
+                             SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS));
+
+  spvtools::Optimizer optimizer(SPV_ENV_UNIVERSAL_1_3);
+  optimizer.RegisterPass(spvtools::CreateRenameDebugSourcePass(
+      {{"a.hlsl", "/tmp/very/long/relocated/path/material.hlsl"}}));
+  optimizer.SetMessageConsumer([](spv_message_level_t, const char*,
+                                   const spv_position_t&, const char* m) {
+    ADD_FAILURE() << m;
+  });
+
+  std::vector<uint32_t> optimized;
+  ASSERT_TRUE(optimizer.Run(binary.data(), binary.size(), &optimized));
+  EXPECT_TRUE(tools.Validate(optimized));
+
+  auto context = BuildModule(SPV_ENV_UNIVERSAL_1_3, nullptr, optimized.data(),
+                             optimized.size());
+  ASSERT_NE(nullptr, context);
+  EXPECT_NE(FindStringByText(context.get(),
+                             "/tmp/very/long/relocated/path/material.hlsl"),
+            nullptr);
+  EXPECT_EQ(FindStringByText(context.get(), "a.hlsl"), nullptr);
 }
 
 }  // namespace

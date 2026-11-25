@@ -252,6 +252,17 @@ Optimizer::PassToken CreateNullPass();
 // Section 3.42.2 of the SPIR-V spec) of the SPIR-V module to be optimized.
 Optimizer::PassToken CreateStripDebugInfoPass();
 
+// Creates a rename-debug-source pass.
+// |source_name_map| maps debug source names (paths) currently stored in the
+// module to the replacement names. Only the file-name operands of OpSource,
+// OpLine and DebugSource instructions are renamed. Line number mappings,
+// inlining chains and all unrelated strings (including entry point names)
+// are preserved. If an OpString holding a source name is also used by a
+// non-source operand, the original string is preserved for those uses and
+// only the source-file uses are redirected to a new OpString.
+Optimizer::PassToken CreateRenameDebugSourcePass(
+    std::unordered_map<std::string, std::string> source_name_map);
+
 // [Deprecated] This will create a strip-nonsemantic-info pass.  See below.
 Optimizer::PassToken CreateStripReflectInfoPass();
 
