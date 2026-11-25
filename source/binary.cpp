@@ -151,8 +151,20 @@ class Parser {
   // returned object will be propagated to the current parse's diagnostic
   // object.
   spvtools::DiagnosticStream diagnostic(spv_result_t error) {
-    return spvtools::DiagnosticStream({0, 0, _.instruction_count}, consumer_,
-                                      "", error);
+    // For a binary module the position is expressed in words, so it is
+    // independent of the endianness the module was saved in: index is the
+    // offset of the first word of the instruction being decoded when the
+    // error was detected, and column is the word count that instruction
+    // declares in its first word (0 when the first word itself could not be
+    // decoded).  A consumer, e.g. a debugger highlighting the offending
+    // bytes, can map the location back to the byte range
+    // [index * 4, (index + column) * 4) in the original module, tell a
+    // truncated instruction (declared range runs past the end of the module)
+    // apart from an undecodable one (zero declared range), and know that
+    // every instruction before word offset index was delivered intact and in
+    // order.
+    return spvtools::DiagnosticStream({0, _.inst_word_count, _.inst_offset},
+                                      consumer_, "", error);
   }
 
   // Returns a diagnostic stream object with the default parse error code.
@@ -211,7 +223,8 @@ class Parser {
           num_words(num_words_arg),
           diagnostic(diagnostic_arg),
           word_index(0),
-          instruction_count(0),
+          inst_offset(0),
+          inst_word_count(0),
           endian(),
           requires_endian_conversion(false) {
       // Temporary storage for parser state within a single instruction.
@@ -225,7 +238,13 @@ class Parser {
     size_t num_words;            // Number of words in the module.
     spv_diagnostic* diagnostic;  // Where diagnostics go.
     size_t word_index;           // The current position in words.
-    size_t instruction_count;    // The count of processed instructions
+    // The word offset of the start of the instruction currently being
+    // decoded.  Used to position diagnostics.
+    size_t inst_offset;
+    // The word count declared by the first word of the instruction currently
+    // being decoded, or 0 if that first word could not be decoded.  Used to
+    // position diagnostics.
+    size_t inst_word_count;
     spv_endianness_t endian;     // The endianness of the binary.
     // Is the SPIR-V binary in a different endianness from the host native
     // endianness?
@@ -308,7 +327,12 @@ spv_result_t Parser::parseModule() {
 }
 
 spv_result_t Parser::parseInstruction() {
-  _.instruction_count++;
+  // Remember where this instruction starts: any diagnostic issued while
+  // decoding it points at this word offset, so a consumer can locate the
+  // offending bytes in the module even when the instruction is incomplete.
+  // The declared word count is still unknown.
+  _.inst_offset = _.word_index;
+  _.inst_word_count = 0;
 
   // The zero values for all members except for opcode are the
   // correct initial values.
@@ -334,6 +358,11 @@ spv_result_t Parser::parseInstruction() {
     return diagnostic() << "Invalid instruction word count: "
                         << inst_word_count;
   }
+  // The first word yielded a valid length, so diagnostics issued from now on
+  // can describe the full declared range of this instruction.  This matters
+  // for instructions with variable-length operands, whose extent cannot be
+  // known from the opcode alone.
+  _.inst_word_count = inst_word_count;
   const spvtools::InstructionDesc* opcode_desc = nullptr;
   const bool opcode_known =
       spvtools::LookupOpcode(static_cast<spv::Op>(inst.opcode), &opcode_desc) ==

@@ -152,8 +152,10 @@ TEST(CInterface, SpecifyConsumerNullDiagnosticForDisassembling) {
         EXPECT_EQ(SPV_MSG_ERROR, level);
         EXPECT_STREQ("input", source);
         EXPECT_EQ(0u, position.line);
-        EXPECT_EQ(0u, position.column);
-        EXPECT_EQ(1u, position.index);
+        // The invalid word is the first word after the 5-word header, and
+        // declares a word count of 65535.
+        EXPECT_EQ(65535u, position.column);
+        EXPECT_EQ(5u, position.index);
         EXPECT_STREQ("Invalid opcode: 65535", message);
       });
 

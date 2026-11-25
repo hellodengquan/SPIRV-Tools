@@ -518,6 +518,15 @@ typedef struct spv_text_t {
   size_t length;
 } spv_text_t;
 
+// A position within the input being processed.  For text input, line and
+// column locate the error and index is the character offset into the input.
+// For a binary SPIR-V module, the position is expressed in words so it does
+// not depend on the endianness the module was saved in: line is 0, index is
+// the offset of the first word of the instruction being decoded when the
+// error was detected, and column is the word count that instruction declares
+// in its first word (0 when the first word itself could not be decoded).
+// The corresponding byte range in the module is therefore
+// [index * 4, (index + column) * 4).
 typedef struct spv_position_t {
   size_t line;
   size_t column;

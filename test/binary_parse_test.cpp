@@ -422,8 +422,10 @@ TEST_F(BinaryParseTest, SpecifyConsumerNullDiagnosticsForBadParse) {
         EXPECT_EQ(SPV_MSG_ERROR, level);
         EXPECT_STREQ("input", source);
         EXPECT_EQ(0u, position.line);
-        EXPECT_EQ(0u, position.column);
-        EXPECT_EQ(1u, position.index);
+        // The invalid word is the first word after the 5-word header, and
+        // declares a word count of 65535.
+        EXPECT_EQ(65535u, position.column);
+        EXPECT_EQ(5u, position.index);
         EXPECT_STREQ("Invalid opcode: 65535", message);
       });
 
@@ -447,8 +449,10 @@ TEST_F(CxxBinaryParseTest, SpecifyConsumerNullDiagnosticsForBadParse) {
         EXPECT_EQ(SPV_MSG_ERROR, level);
         EXPECT_STREQ("input", source);
         EXPECT_EQ(0u, position.line);
-        EXPECT_EQ(0u, position.column);
-        EXPECT_EQ(1u, position.index);
+        // The invalid word is the first word after the 5-word header, and
+        // declares a word count of 65535.
+        EXPECT_EQ(65535u, position.column);
+        EXPECT_EQ(5u, position.index);
         EXPECT_STREQ("Invalid opcode: 65535", message);
       });
 
@@ -528,6 +532,96 @@ TEST_F(CxxBinaryParseTest, SpecifyConsumerSpecifyDiagnosticsForBadParse) {
                                &diagnostic_));
   EXPECT_EQ(0, invocation);
   EXPECT_STREQ("Invalid opcode: 65535", diagnostic_->error);
+}
+
+// When decoding fails, the diagnostic position must locate the failing
+// instruction by its word offset within the module (index) and its declared
+// word count (column), so a consumer can compute the byte range of the
+// problem right after the last complete instruction.
+TEST_F(BinaryParseTest, DiagnosticPositionForTruncatedVariableLengthOperand) {
+  for (bool endian_swap : kSwapEndians) {
+    // Two complete instructions, then an OpString whose declared word count
+    // (3) exceeds the words remaining in the module: its variable-length
+    // string operand is missing entirely.
+    const auto words = Concatenate(
+        {ExpectedHeaderForBound(4),
+         MakeInstruction(spv::Op::OpTypeVoid, {1}),
+         MakeInstruction(spv::Op::OpTypeInt, {2, 32, 1}),
+         {spvOpcodeMake(3, spv::Op::OpString), 3 /* result id */}});
+    InSequence calls_expected_in_specific_order;
+    EXPECT_HEADER(4).WillOnce(Return(SPV_SUCCESS));
+    // The complete instructions are still delivered, in their original
+    // order, before the failure is reported.
+    EXPECT_CALL(client_, Instruction(MakeParsedVoidTypeInstruction(1)))
+        .WillOnce(Return(SPV_SUCCESS));
+    EXPECT_CALL(client_, Instruction(MakeParsedInt32TypeInstruction(2)))
+        .WillOnce(Return(SPV_SUCCESS));
+    Parse(words, SPV_ERROR_INVALID_BINARY, endian_swap);
+    ASSERT_NE(nullptr, diagnostic_);
+    EXPECT_STREQ(diagnostic_->error,
+                 "End of input reached while decoding OpString starting at "
+                 "word 11: missing literal string operand at word offset "
+                 "2.");
+    EXPECT_EQ(0u, diagnostic_->position.line);
+    // The module start point of the incomplete instruction: 5 header words
+    // plus the two complete instructions (2 and 4 words).
+    EXPECT_EQ(11u, diagnostic_->position.index);
+    // The declared range of the instruction.
+    EXPECT_EQ(3u, diagnostic_->position.column);
+    // The declared range runs past the end of the module, so the instruction
+    // content is incomplete (as opposed to the instruction being
+    // undecodable).
+    EXPECT_LT(words.size(),
+              diagnostic_->position.index + diagnostic_->position.column);
+    spvDiagnosticDestroy(diagnostic_);
+    diagnostic_ = nullptr;
+  }
+}
+
+// When the first word of an instruction cannot be decoded, the diagnostic
+// position still locates the instruction, but reports a zero declared word
+// count to distinguish the case from incomplete instruction content.
+TEST_F(BinaryParseTest, DiagnosticPositionForUndecodableInstruction) {
+  for (bool endian_swap : kSwapEndians) {
+    const auto words = Concatenate(
+        {ExpectedHeaderForBound(1), {spvOpcodeMake(0, spv::Op::OpNop)}});
+    EXPECT_HEADER(1).WillOnce(Return(SPV_SUCCESS));
+    EXPECT_CALL(client_, Instruction(_)).Times(0);  // No instruction callback.
+    Parse(words, SPV_ERROR_INVALID_BINARY, endian_swap);
+    ASSERT_NE(nullptr, diagnostic_);
+    EXPECT_STREQ(diagnostic_->error, "Invalid instruction word count: 0");
+    EXPECT_EQ(0u, diagnostic_->position.line);
+    EXPECT_EQ(5u, diagnostic_->position.index);
+    EXPECT_EQ(0u, diagnostic_->position.column);
+    spvDiagnosticDestroy(diagnostic_);
+    diagnostic_ = nullptr;
+  }
+}
+
+// The same shader saved with the opposite byte order must be located to the
+// same segment: the position is expressed in words, so it does not depend on
+// endianness.
+TEST_F(BinaryParseTest, DiagnosticPositionIsEndianIndependent) {
+  spv_position_t positions[2] = {};
+  for (bool endian_swap : kSwapEndians) {
+    const auto words = Concatenate(
+        {ExpectedHeaderForBound(4),
+         MakeInstruction(spv::Op::OpTypeVoid, {1}),
+         MakeInstruction(spv::Op::OpTypeInt, {2, 32, 1}),
+         {spvOpcodeMake(3, spv::Op::OpString), 3 /* result id */}});
+    EXPECT_HEADER(4).WillOnce(Return(SPV_SUCCESS));
+    EXPECT_CALL(client_, Instruction(_))
+        .Times(2)
+        .WillRepeatedly(Return(SPV_SUCCESS));
+    Parse(words, SPV_ERROR_INVALID_BINARY, endian_swap);
+    ASSERT_NE(nullptr, diagnostic_);
+    positions[endian_swap ? 1 : 0] = diagnostic_->position;
+    spvDiagnosticDestroy(diagnostic_);
+    diagnostic_ = nullptr;
+  }
+  EXPECT_EQ(positions[0].line, positions[1].line);
+  EXPECT_EQ(positions[0].column, positions[1].column);
+  EXPECT_EQ(positions[0].index, positions[1].index);
 }
 
 TEST_F(BinaryParseTest,
