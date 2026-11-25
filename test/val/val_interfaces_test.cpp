@@ -2376,6 +2376,804 @@ TEST_F(ValidateInterfacesTest, VulkanComponentArrayOfArraysOutput) {
                         "arrays of scalars or vectors"));
 }
 
+// =====================================================================
+// Component-level location packing within a single entry point.
+//
+// Vulkan assigns each interface variable a span of slots addressed as
+// 4 * location + component. The tests below pin down which declarations
+// actually occupy the same slot, including the real footprint of arrays
+// (one stride per element) and matrices (one location per column).
+// =====================================================================
+
+// Two independent scalar inputs may share a location as long as their
+// Component decorations pick different slots.
+TEST_F(ValidateInterfacesTest,
+       VulkanLocationTwoScalarsShareLocationDifferentComponents) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %var1 %var2
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %var1 Location 0
+OpDecorate %var1 Component 0
+OpDecorate %var2 Location 0
+OpDecorate %var2 Component 1
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%ptr_input_float = OpTypePointer Input %float
+%var1 = OpVariable %ptr_input_float Input
+%var2 = OpVariable %ptr_input_float Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+}
+
+// Without a disambiguating component, two scalars collide on the exact same
+// slot and the diagnostic points back at location 0, component 0.
+TEST_F(ValidateInterfacesTest, VulkanLocationTwoScalarsSameComponentConflict) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %var1 %var2
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %var1 Location 0
+OpDecorate %var1 Component 0
+OpDecorate %var2 Location 0
+OpDecorate %var2 Component 0
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%ptr_input_float = OpTypePointer Input %float
+%var1 = OpVariable %ptr_input_float Input
+%var2 = OpVariable %ptr_input_float Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_ERROR_INVALID_DATA, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+  EXPECT_THAT(getDiagnosticString(),
+              AnyVUID("VUID-StandaloneSpirv-OpEntryPoint-08721"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Entry-point has conflicting input location assignment "
+                        "at location 0, component 0"));
+}
+
+// A vec3 occupies components 0..2 of its location, leaving component 3 free
+// for a scalar to pack into.
+TEST_F(ValidateInterfacesTest, VulkanLocationScalarFillsGapAfterVector) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %vec %scalar
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %vec Location 0
+OpDecorate %scalar Location 0
+OpDecorate %scalar Component 3
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v3float = OpTypeVector %float 3
+%ptr_input_vec = OpTypePointer Input %v3float
+%ptr_input_float = OpTypePointer Input %float
+%vec = OpVariable %ptr_input_vec Input
+%scalar = OpVariable %ptr_input_float Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+}
+
+// A scalar placed on a component already covered by the vec3 conflicts.
+TEST_F(ValidateInterfacesTest, VulkanLocationScalarOverlapsVectorComponent) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %vec %scalar
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %vec Location 0
+OpDecorate %scalar Location 0
+OpDecorate %scalar Component 2
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v3float = OpTypeVector %float 3
+%ptr_input_vec = OpTypePointer Input %v3float
+%ptr_input_float = OpTypePointer Input %float
+%vec = OpVariable %ptr_input_vec Input
+%scalar = OpVariable %ptr_input_float Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_ERROR_INVALID_DATA, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+  EXPECT_THAT(getDiagnosticString(),
+              AnyVUID("VUID-StandaloneSpirv-OpEntryPoint-08721"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Entry-point has conflicting input location assignment "
+                        "at location 0, component 2"));
+}
+
+// A 64-bit scalar consumes two components, so a 32-bit scalar may start at
+// component 2 without overlapping.
+TEST_F(ValidateInterfacesTest, VulkanLocation64BitScalarConsumesTwoComponents) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Float64
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %dbl %flt
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %dbl Location 0
+OpDecorate %dbl Flat
+OpDecorate %flt Location 0
+OpDecorate %flt Component 2
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%double = OpTypeFloat 64
+%ptr_input_double = OpTypePointer Input %double
+%ptr_input_float = OpTypePointer Input %float
+%dbl = OpVariable %ptr_input_double Input
+%flt = OpVariable %ptr_input_float Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+}
+
+// The second component occupied by the 64-bit scalar must be reported.
+TEST_F(ValidateInterfacesTest,
+       VulkanLocation64BitScalarComponentOverlapConflict) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Float64
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %dbl %flt
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %dbl Location 0
+OpDecorate %dbl Flat
+OpDecorate %flt Location 0
+OpDecorate %flt Component 1
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%double = OpTypeFloat 64
+%ptr_input_double = OpTypePointer Input %double
+%ptr_input_float = OpTypePointer Input %float
+%dbl = OpVariable %ptr_input_double Input
+%flt = OpVariable %ptr_input_float Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_ERROR_INVALID_DATA, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+  EXPECT_THAT(getDiagnosticString(),
+              AnyVUID("VUID-StandaloneSpirv-OpEntryPoint-08721"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Entry-point has conflicting input location assignment "
+                        "at location 0, component 1"));
+}
+
+// A dvec3 spans two whole locations; a scalar at the next free location is
+// fine.
+TEST_F(ValidateInterfacesTest, VulkanLocationDvec3ConsumesTwoLocations) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Float64
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %dvec %scalar
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %dvec Location 0
+OpDecorate %scalar Location 2
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%double = OpTypeFloat 64
+%dvec3 = OpTypeVector %double 3
+%ptr_input_dvec = OpTypePointer Input %dvec3
+%ptr_input_float = OpTypePointer Input %float
+%dvec = OpVariable %ptr_input_dvec Input
+%scalar = OpVariable %ptr_input_float Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+}
+
+// A scalar landing in the second location consumed by the dvec3 conflicts at
+// location 1, component 0.
+TEST_F(ValidateInterfacesTest,
+       VulkanLocationDvec3SecondLocationOverlapConflict) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Float64
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %dvec %scalar
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %dvec Location 0
+OpDecorate %scalar Location 1
+OpDecorate %scalar Component 0
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%double = OpTypeFloat 64
+%dvec3 = OpTypeVector %double 3
+%ptr_input_dvec = OpTypePointer Input %dvec3
+%ptr_input_float = OpTypePointer Input %float
+%dvec = OpVariable %ptr_input_dvec Input
+%scalar = OpVariable %ptr_input_float Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_ERROR_INVALID_DATA, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+  EXPECT_THAT(getDiagnosticString(),
+              AnyVUID("VUID-StandaloneSpirv-OpEntryPoint-08721"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Entry-point has conflicting input location assignment "
+                        "at location 1, component 0"));
+}
+
+// A top-level scalar array strides one location per element, occupying only
+// component 0 of each location. Another scalar can pack into component 1.
+TEST_F(ValidateInterfacesTest, VulkanLocationScalarArrayRealStride) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %arr %scalar
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %arr Location 0
+OpDecorate %scalar Location 0
+OpDecorate %scalar Component 1
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%uint_3 = OpConstant %uint 3
+%arr_float = OpTypeArray %float %uint_3
+%ptr_input_arr = OpTypePointer Input %arr_float
+%ptr_input_float = OpTypePointer Input %float
+%arr = OpVariable %ptr_input_arr Input
+%scalar = OpVariable %ptr_input_float Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+}
+
+// The second element of the scalar array really occupies location 1,
+// component 0.
+TEST_F(ValidateInterfacesTest, VulkanLocationScalarArrayStrideConflict) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %arr %scalar
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %arr Location 0
+OpDecorate %scalar Location 1
+OpDecorate %scalar Component 0
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%uint_3 = OpConstant %uint 3
+%arr_float = OpTypeArray %float %uint_3
+%ptr_input_arr = OpTypePointer Input %arr_float
+%ptr_input_float = OpTypePointer Input %float
+%arr = OpVariable %ptr_input_arr Input
+%scalar = OpVariable %ptr_input_float Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_ERROR_INVALID_DATA, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+  EXPECT_THAT(getDiagnosticString(),
+              AnyVUID("VUID-StandaloneSpirv-OpEntryPoint-08721"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Entry-point has conflicting input location assignment "
+                        "at location 1, component 0"));
+}
+
+// An array of vec2 takes components 0..1 of each strided location; component
+// 2 stays available on every element.
+TEST_F(ValidateInterfacesTest, VulkanLocationVectorArrayRealStride) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %arr %scalar1 %scalar2
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %arr Location 0
+OpDecorate %scalar1 Location 0
+OpDecorate %scalar1 Component 2
+OpDecorate %scalar2 Location 1
+OpDecorate %scalar2 Component 2
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v2float = OpTypeVector %float 2
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%arr_v2float = OpTypeArray %v2float %uint_2
+%ptr_input_arr = OpTypePointer Input %arr_v2float
+%ptr_input_float = OpTypePointer Input %float
+%arr = OpVariable %ptr_input_arr Input
+%scalar1 = OpVariable %ptr_input_float Input
+%scalar2 = OpVariable %ptr_input_float Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+}
+
+// Hitting the second component of the second vec2 array element must be
+// reported at that element's location.
+TEST_F(ValidateInterfacesTest, VulkanLocationVectorArrayStrideConflict) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %arr %scalar
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %arr Location 0
+OpDecorate %scalar Location 1
+OpDecorate %scalar Component 1
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v2float = OpTypeVector %float 2
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%arr_v2float = OpTypeArray %v2float %uint_2
+%ptr_input_arr = OpTypePointer Input %arr_v2float
+%ptr_input_float = OpTypePointer Input %float
+%arr = OpVariable %ptr_input_arr Input
+%scalar = OpVariable %ptr_input_float Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_ERROR_INVALID_DATA, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+  EXPECT_THAT(getDiagnosticString(),
+              AnyVUID("VUID-StandaloneSpirv-OpEntryPoint-08721"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Entry-point has conflicting input location assignment "
+                        "at location 1, component 1"));
+}
+
+// A mat3 really occupies one full location per column, i.e. locations 0..2.
+TEST_F(ValidateInterfacesTest, VulkanLocationMatrixRealOccupancy) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %mat %scalar
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %mat Location 0
+OpDecorate %scalar Location 3
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v3float = OpTypeVector %float 3
+%mat3 = OpTypeMatrix %v3float 3
+%ptr_input_mat = OpTypePointer Input %mat3
+%ptr_input_float = OpTypePointer Input %float
+%mat = OpVariable %ptr_input_mat Input
+%scalar = OpVariable %ptr_input_float Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+}
+
+// Every component of every matrix column is reserved, so component 3 of the
+// last column's location conflicts.
+TEST_F(ValidateInterfacesTest, VulkanLocationMatrixColumnOverlapConflict) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %mat %scalar
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %mat Location 0
+OpDecorate %scalar Location 2
+OpDecorate %scalar Component 3
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v3float = OpTypeVector %float 3
+%mat3 = OpTypeMatrix %v3float 3
+%ptr_input_mat = OpTypePointer Input %mat3
+%ptr_input_float = OpTypePointer Input %float
+%mat = OpVariable %ptr_input_mat Input
+%scalar = OpVariable %ptr_input_float Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_ERROR_INVALID_DATA, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+  EXPECT_THAT(getDiagnosticString(),
+              AnyVUID("VUID-StandaloneSpirv-OpEntryPoint-08721"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Entry-point has conflicting input location assignment "
+                        "at location 2, component 3"));
+}
+
+// Block-decorated struct members use the same strided accounting: an array
+// member only reserves component 0 per location, leaving component 1 free.
+TEST_F(ValidateInterfacesTest, VulkanLocationBlockMemberArrayStrided) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %var
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %struct Block
+OpMemberDecorate %struct 0 Location 0
+OpMemberDecorate %struct 1 Location 0
+OpMemberDecorate %struct 1 Component 1
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%uint_3 = OpConstant %uint 3
+%arr_float = OpTypeArray %float %uint_3
+%struct = OpTypeStruct %arr_float %float
+%ptr_input_struct = OpTypePointer Input %struct
+%var = OpVariable %ptr_input_struct Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+}
+
+// The struct member conflict is reported at the exact slot reserved by the
+// strided array member (location 1, component 0).
+TEST_F(ValidateInterfacesTest, VulkanLocationBlockMemberArrayStridedConflict) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %var
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %struct Block
+OpMemberDecorate %struct 0 Location 0
+OpMemberDecorate %struct 1 Location 1
+OpMemberDecorate %struct 1 Component 0
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%uint_3 = OpConstant %uint 3
+%arr_float = OpTypeArray %float %uint_3
+%struct = OpTypeStruct %arr_float %float
+%ptr_input_struct = OpTypePointer Input %struct
+%var = OpVariable %ptr_input_struct Input
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_ERROR_INVALID_DATA, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+  EXPECT_THAT(getDiagnosticString(),
+              AnyVUID("VUID-StandaloneSpirv-OpEntryPoint-08721"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Entry-point has conflicting input location assignment "
+                        "at location 1, component 0"));
+}
+
+// =====================================================================
+// Per-entry-point and per-direction independent location bookkeeping.
+//
+// A single module can feed several pipelines. Location slots are computed
+// separately for every OpEntryPoint, and input and output each get their
+// own slot set.
+// =====================================================================
+
+// Two entry points may each claim the same input slot because their location
+// sets never share state.
+TEST_F(ValidateInterfacesTest,
+       VulkanLocationTwoEntryPointsIndependentInputSets) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main1 "main1" %var1
+OpEntryPoint Fragment %main2 "main2" %var2
+OpExecutionMode %main1 OriginUpperLeft
+OpExecutionMode %main2 OriginUpperLeft
+OpDecorate %var1 Location 0
+OpDecorate %var1 Component 0
+OpDecorate %var2 Location 0
+OpDecorate %var2 Component 0
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%ptr_input_float = OpTypePointer Input %float
+%var1 = OpVariable %ptr_input_float Input
+%var2 = OpVariable %ptr_input_float Input
+%main1 = OpFunction %void None %void_fn
+%entry1 = OpLabel
+OpReturn
+OpFunctionEnd
+%main2 = OpFunction %void None %void_fn
+%entry2 = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+}
+
+// A conflict inside the first entry point is reported against its own slot;
+// the clean second entry point does not contribute any locations to the
+// first one's check.
+TEST_F(ValidateInterfacesTest, VulkanLocationConflictLocalizedToOneEntryPoint) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main1 "main1" %var1 %var2
+OpEntryPoint Fragment %main2 "main2" %var3
+OpExecutionMode %main1 OriginUpperLeft
+OpExecutionMode %main2 OriginUpperLeft
+OpDecorate %var1 Location 0
+OpDecorate %var1 Component 0
+OpDecorate %var2 Location 0
+OpDecorate %var2 Component 0
+OpDecorate %var3 Location 5
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%ptr_input_float = OpTypePointer Input %float
+%var1 = OpVariable %ptr_input_float Input
+%var2 = OpVariable %ptr_input_float Input
+%var3 = OpVariable %ptr_input_float Input
+%main1 = OpFunction %void None %void_fn
+%entry1 = OpLabel
+OpReturn
+OpFunctionEnd
+%main2 = OpFunction %void None %void_fn
+%entry2 = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_ERROR_INVALID_DATA, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+  EXPECT_THAT(getDiagnosticString(),
+              AnyVUID("VUID-StandaloneSpirv-OpEntryPoint-08721"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Entry-point has conflicting input location assignment "
+                        "at location 0, component 0"));
+}
+
+// The same global variable can be on the interface of several entry points
+// and is counted once per entry point, so no self-conflict is produced.
+TEST_F(ValidateInterfacesTest, VulkanLocationSharedVariableAcrossEntryPoints) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main1 "main1" %var
+OpEntryPoint Fragment %main2 "main2" %var
+OpExecutionMode %main1 OriginUpperLeft
+OpExecutionMode %main2 OriginUpperLeft
+OpDecorate %var Location 0
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%ptr_input_float = OpTypePointer Input %float
+%var = OpVariable %ptr_input_float Input
+%main1 = OpFunction %void None %void_fn
+%entry1 = OpLabel
+OpReturn
+OpFunctionEnd
+%main2 = OpFunction %void None %void_fn
+%entry2 = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+}
+
+// Input and output keep independent slot sets: the same location/component
+// can be used in both directions within one entry point.
+TEST_F(ValidateInterfacesTest, VulkanLocationInputAndOutputSameSlot) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %in_var %out_var
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %in_var Location 0
+OpDecorate %in_var Component 0
+OpDecorate %out_var Location 0
+OpDecorate %out_var Component 0
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%ptr_input_float = OpTypePointer Input %float
+%ptr_output_float = OpTypePointer Output %float
+%in_var = OpVariable %ptr_input_float Input
+%out_var = OpVariable %ptr_output_float Output
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+}
+
+// Output conflicts are tracked in the output slot set and surface the output
+// VUID together with the conflicting location/component.
+TEST_F(ValidateInterfacesTest, VulkanLocationOutputSameSlotConflict) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %var1 %var2
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %var1 Location 1
+OpDecorate %var1 Component 2
+OpDecorate %var2 Location 1
+OpDecorate %var2 Component 2
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%ptr_output_float = OpTypePointer Output %float
+%var1 = OpVariable %ptr_output_float Output
+%var2 = OpVariable %ptr_output_float Output
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_ERROR_INVALID_DATA, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+  EXPECT_THAT(getDiagnosticString(),
+              AnyVUID("VUID-StandaloneSpirv-OpEntryPoint-08722"));
+  EXPECT_THAT(
+      getDiagnosticString(),
+      HasSubstr("Entry-point has conflicting output location assignment "
+                "at location 1, component 2"));
+}
+
+// A vertex entry point writing slots and a fragment entry point reading the
+// same slots are validated independently and both pass.
+TEST_F(ValidateInterfacesTest,
+       VulkanLocationVertexAndFragmentEntryPointsSameSlots) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Vertex %vs "vs" %out1 %out2
+OpEntryPoint Fragment %fs "fs" %in1 %in2
+OpExecutionMode %fs OriginUpperLeft
+OpDecorate %out1 Location 0
+OpDecorate %out1 Component 0
+OpDecorate %out2 Location 0
+OpDecorate %out2 Component 1
+OpDecorate %in1 Location 0
+OpDecorate %in1 Component 0
+OpDecorate %in2 Location 0
+OpDecorate %in2 Component 1
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%ptr_input_float = OpTypePointer Input %float
+%ptr_output_float = OpTypePointer Output %float
+%out1 = OpVariable %ptr_output_float Output
+%out2 = OpVariable %ptr_output_float Output
+%in1 = OpVariable %ptr_input_float Input
+%in2 = OpVariable %ptr_input_float Input
+%vs = OpFunction %void None %void_fn
+%vs_entry = OpLabel
+OpReturn
+OpFunctionEnd
+%fs = OpFunction %void None %void_fn
+%fs_entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+}
+
+// When the second entry point is the conflicting one, its own slot
+// (location 2, component 3) is reported rather than anything from the clean
+// first entry point.
+TEST_F(ValidateInterfacesTest,
+       VulkanLocationConflictInSecondEntryPointReportsItsSlot) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main1 "main1" %var1
+OpEntryPoint Fragment %main2 "main2" %var2 %var3
+OpExecutionMode %main1 OriginUpperLeft
+OpExecutionMode %main2 OriginUpperLeft
+OpDecorate %var1 Location 0
+OpDecorate %var2 Location 2
+OpDecorate %var2 Component 3
+OpDecorate %var3 Location 2
+OpDecorate %var3 Component 3
+%void = OpTypeVoid
+%void_fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%ptr_input_float = OpTypePointer Input %float
+%var1 = OpVariable %ptr_input_float Input
+%var2 = OpVariable %ptr_input_float Input
+%var3 = OpVariable %ptr_input_float Input
+%main1 = OpFunction %void None %void_fn
+%entry1 = OpLabel
+OpReturn
+OpFunctionEnd
+%main2 = OpFunction %void None %void_fn
+%entry2 = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text, SPV_ENV_VULKAN_1_0);
+  EXPECT_EQ(SPV_ERROR_INVALID_DATA, ValidateInstructions(SPV_ENV_VULKAN_1_0));
+  EXPECT_THAT(getDiagnosticString(),
+              AnyVUID("VUID-StandaloneSpirv-OpEntryPoint-08721"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Entry-point has conflicting input location assignment "
+                        "at location 2, component 3"));
+}
+
 }  // namespace
 }  // namespace val
 }  // namespace spvtools
