@@ -168,6 +168,15 @@ class AggressiveDCEPass : public MemPass {
   Pass::Status KillDeadInstructions(const Function* func,
                                     std::list<BasicBlock*>& structured_order);
 
+  // Removes NonSemantic debug records that no surviving instruction can
+  // explain, such as a DebugLocalVariable whose every DebugDeclare/DebugValue
+  // was eliminated or a DebugInlinedAt/DebugLexicalBlock that was only
+  // referenced by removed instructions.  Keeping them would leave debug
+  // records in the produced module that describe computations that no longer
+  // exist.  Records still named by a surviving instruction are preserved.
+  // Returns true if anything was removed.
+  bool RemoveUnusedDebugRecords();
+
   // Adds the instructions that define the operands of |inst| to the work list.
   void AddOperandsToWorkList(const Instruction* inst);
 

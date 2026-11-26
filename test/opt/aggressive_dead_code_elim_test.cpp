@@ -9372,6 +9372,205 @@ OpFunctionEnd
   SinglePassRunAndMatch<AggressiveDCEPass>(spirv, true);
 }
 
+TEST_F(AggressiveDCETest, RemoveDebugRecordsOfEliminatedVariables) {
+  // A DebugLocalVariable whose every DebugDeclare and store is removed must not
+  // survive: nothing in the result would describe the variable it names.  The
+  // stored value is itself dead, so no DebugValue is synthesized for it.
+  // The live DebugLocalVariable that still has a DebugDeclare and a load must
+  // stay.  Both variables use different names so the checks can tell them apart
+  // by their OpString operand.
+  const std::string spirv = R"(
+               OpCapability Shader
+               OpExtension "SPV_KHR_non_semantic_info"
+          %1 = OpExtInstImport "NonSemantic.Shader.DebugInfo.100"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %out
+               OpExecutionMode %main OriginUpperLeft
+          %4 = OpString "material.hlsl"
+          %5 = OpString "float"
+          %6 = OpString "main"
+          %7 = OpString "dead_var"
+          %8 = OpString "live_var"
+               OpDecorate %out Location 0
+   %float = OpTypeFloat 32
+    %float_1 = OpConstant %float 1
+    %float_0 = OpConstant %float 0
+%_ptr_Output_float = OpTypePointer Output %float
+%_ptr_Function_float = OpTypePointer Function %float
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+    %uint_1 = OpConstant %uint 1
+    %uint_3 = OpConstant %uint 3
+    %uint_4 = OpConstant %uint 4
+    %uint_5 = OpConstant %uint 5
+    %uint_6 = OpConstant %uint 6
+    %uint_9 = OpConstant %uint 9
+    %uint_32 = OpConstant %uint 32
+         %out = OpVariable %_ptr_Output_float Output
+         %20 = OpTypeFunction %void
+         %21 = OpExtInst %void %1 DebugExpression
+         %22 = OpExtInst %void %1 DebugSource %4
+         %23 = OpExtInst %void %1 DebugCompilationUnit %uint_1 %uint_4 %22 %uint_5
+         %24 = OpExtInst %void %1 DebugTypeBasic %5 %uint_32 %uint_3 %uint_32
+         %25 = OpExtInst %void %1 DebugTypeFunction %uint_3 %void
+         %26 = OpExtInst %void %1 DebugFunction %6 %25 %22 %uint_4 %uint_1 %23 %6 %uint_3 %uint_4
+         %27 = OpExtInst %void %1 DebugLexicalBlock %22 %uint_6 %uint_3 %26
+; CHECK-NOT: DebugLocalVariable %7
+         %34 = OpExtInst %void %1 DebugLocalVariable %7 %24 %22 %uint_6 %uint_6 %27 %uint_4
+; CHECK: DebugLocalVariable %8
+         %29 = OpExtInst %void %1 DebugLocalVariable %8 %24 %22 %uint_6 %uint_6 %27 %uint_4
+       %main = OpFunction %void None %20
+         %31 = OpLabel
+         %32 = OpVariable %_ptr_Function_float Function
+         %33 = OpVariable %_ptr_Function_float Function
+         %40 = OpExtInst %void %1 DebugScope %27
+         %41 = OpExtInst %void %1 DebugLine %22 %uint_6 %uint_6 %uint_1 %uint_9
+; CHECK-NOT: DebugDeclare %34
+         %42 = OpExtInst %void %1 DebugDeclare %34 %32 %21
+         %35 = OpFMul %float %float_0 %float_0
+               OpStore %32 %35
+         %43 = OpExtInst %void %1 DebugDeclare %29 %33 %21
+               OpStore %33 %float_1
+         %36 = OpLoad %float %33
+               OpStore %out %36
+               OpReturn
+               OpFunctionEnd
+)";
+
+  SetTargetEnv(SPV_ENV_UNIVERSAL_1_6);
+  SetAssembleOptions(SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  SinglePassRunAndMatch<AggressiveDCEPass>(spirv, false);
+}
+
+TEST_F(AggressiveDCETest, KeepDebugRecordsStillUsedBySurvivingCode) {
+  // Two inline sites share one DebugInlinedAt.  When one site's computation is
+  // eliminated the shared position must survive because the other site still
+  // refers to it; otherwise the surviving call site loses its inline chain.
+  const std::string spirv = R"(
+               OpCapability Shader
+               OpExtension "SPV_KHR_non_semantic_info"
+          %1 = OpExtInstImport "NonSemantic.Shader.DebugInfo.100"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %out
+               OpExecutionMode %main OriginUpperLeft
+          %4 = OpString "material.hlsl"
+          %5 = OpString "float"
+          %6 = OpString "main"
+          %7 = OpString "callee"
+               OpDecorate %out Location 0
+   %float = OpTypeFloat 32
+    %float_1 = OpConstant %float 1
+    %float_0 = OpConstant %float 0
+%_ptr_Output_float = OpTypePointer Output %float
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+    %uint_1 = OpConstant %uint 1
+    %uint_3 = OpConstant %uint 3
+    %uint_4 = OpConstant %uint 4
+    %uint_5 = OpConstant %uint 5
+    %uint_6 = OpConstant %uint 6
+    %uint_9 = OpConstant %uint 9
+    %uint_10 = OpConstant %uint 10
+    %uint_32 = OpConstant %uint 32
+         %out = OpVariable %_ptr_Output_float Output
+         %20 = OpTypeFunction %void
+         %22 = OpExtInst %void %1 DebugSource %4
+         %23 = OpExtInst %void %1 DebugCompilationUnit %uint_1 %uint_4 %22 %uint_5
+         %25 = OpExtInst %void %1 DebugTypeFunction %uint_3 %void
+         %26 = OpExtInst %void %1 DebugFunction %6 %25 %22 %uint_4 %uint_1 %23 %6 %uint_3 %uint_4
+         %27 = OpExtInst %void %1 DebugFunction %7 %25 %22 %uint_6 %uint_1 %23 %7 %uint_3 %uint_6
+; CHECK: [[inl:%\w+]] = OpExtInst %void {{%\w+}} DebugInlinedAt %uint_10 %26
+         %28 = OpExtInst %void %1 DebugInlinedAt %uint_10 %26
+       %main = OpFunction %void None %20
+         %31 = OpLabel
+         %40 = OpExtInst %void %1 DebugScope %26
+         %41 = OpExtInst %void %1 DebugLine %22 %uint_10 %uint_10 %uint_1 %uint_9
+               OpStore %out %float_1
+; dead inline site shares the position but its computation is removed
+         %42 = OpExtInst %void %1 DebugScope %27 %28
+         %43 = OpExtInst %void %1 DebugLine %22 %uint_10 %uint_10 %uint_1 %uint_9
+         %44 = OpFMul %float %float_0 %float_0
+; CHECK: DebugScope %27 [[inl]]
+         %45 = OpExtInst %void %1 DebugScope %27 %28
+         %46 = OpExtInst %void %1 DebugLine %22 %uint_10 %uint_10 %uint_1 %uint_9
+         %47 = OpFAdd %float %float_1 %float_1
+               OpStore %out %47
+               OpReturn
+               OpFunctionEnd
+)";
+
+  SetTargetEnv(SPV_ENV_UNIVERSAL_1_6);
+  SetAssembleOptions(SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  SinglePassRunAndMatch<AggressiveDCEPass>(spirv, false);
+}
+
+TEST_F(AggressiveDCETest, RemoveDebugRecordsStillUsedBySurvivingCode) {
+  // A DebugInlinedAt that only the eliminated inline site referenced is removed,
+  // while a sibling DebugInlinedAt used by the surviving site is kept.  This
+  // keeps the surviving call site's inline chain traceable to the right caller.
+  const std::string spirv = R"(
+               OpCapability Shader
+               OpExtension "SPV_KHR_non_semantic_info"
+          %1 = OpExtInstImport "NonSemantic.Shader.DebugInfo.100"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %out
+               OpExecutionMode %main OriginUpperLeft
+          %4 = OpString "material.hlsl"
+          %5 = OpString "float"
+          %6 = OpString "main"
+          %7 = OpString "callee"
+               OpDecorate %out Location 0
+   %float = OpTypeFloat 32
+    %float_1 = OpConstant %float 1
+    %float_0 = OpConstant %float 0
+%_ptr_Output_float = OpTypePointer Output %float
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+    %uint_1 = OpConstant %uint 1
+    %uint_3 = OpConstant %uint 3
+    %uint_4 = OpConstant %uint 4
+    %uint_5 = OpConstant %uint 5
+    %uint_6 = OpConstant %uint 6
+    %uint_9 = OpConstant %uint 9
+    %uint_10 = OpConstant %uint 10
+    %uint_11 = OpConstant %uint 11
+    %uint_12 = OpConstant %uint 12
+    %uint_32 = OpConstant %uint 32
+         %out = OpVariable %_ptr_Output_float Output
+         %20 = OpTypeFunction %void
+         %22 = OpExtInst %void %1 DebugSource %4
+         %23 = OpExtInst %void %1 DebugCompilationUnit %uint_1 %uint_4 %22 %uint_5
+         %25 = OpExtInst %void %1 DebugTypeFunction %uint_3 %void
+         %26 = OpExtInst %void %1 DebugFunction %6 %25 %22 %uint_4 %uint_1 %23 %6 %uint_3 %uint_4
+         %27 = OpExtInst %void %1 DebugFunction %7 %25 %22 %uint_6 %uint_1 %23 %7 %uint_3 %uint_6
+; CHECK-NOT: DebugInlinedAt %uint_10
+         %28 = OpExtInst %void %1 DebugInlinedAt %uint_10 %26
+; CHECK-NOT: DebugInlinedAt %uint_10
+; CHECK: [[inl:%\w+]] = OpExtInst %void {{%\w+}} DebugInlinedAt %uint_12 %26
+         %29 = OpExtInst %void %1 DebugInlinedAt %uint_12 %26
+       %main = OpFunction %void None %20
+         %31 = OpLabel
+         %40 = OpExtInst %void %1 DebugScope %26
+         %41 = OpExtInst %void %1 DebugLine %22 %uint_10 %uint_10 %uint_1 %uint_9
+               OpStore %out %float_1
+; dead inline site uses the removed position
+         %42 = OpExtInst %void %1 DebugScope %27 %28
+         %43 = OpExtInst %void %1 DebugLine %22 %uint_10 %uint_10 %uint_1 %uint_9
+         %44 = OpFMul %float %float_0 %float_0
+; CHECK: DebugScope %27 [[inl]]
+         %45 = OpExtInst %void %1 DebugScope %27 %29
+         %46 = OpExtInst %void %1 DebugLine %22 %uint_12 %uint_12 %uint_1 %uint_9
+         %47 = OpFAdd %float %float_1 %float_1
+               OpStore %out %47
+               OpReturn
+               OpFunctionEnd
+)";
+
+  SetTargetEnv(SPV_ENV_UNIVERSAL_1_6);
+  SetAssembleOptions(SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS);
+  SinglePassRunAndMatch<AggressiveDCEPass>(spirv, false);
+}
+
 }  // namespace
 }  // namespace opt
 }  // namespace spvtools

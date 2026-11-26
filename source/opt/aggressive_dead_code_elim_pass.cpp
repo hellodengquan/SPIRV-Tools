@@ -426,6 +426,64 @@ Pass::Status AggressiveDCEPass::KillDeadInstructions(
                   : Pass::Status::SuccessWithoutChange;
 }
 
+bool AggressiveDCEPass::RemoveUnusedDebugRecords() {
+  // Iterate to a fixed point: removing a record can leave its operands without
+  // any user, which in turn makes them removable too.
+  bool ever_modified = false;
+  bool modified = true;
+  while (modified) {
+    modified = false;
+
+    // Gather the ids that are named by the instructions remaining in the
+    // module, either as their scope (which the def-use manager does not track)
+    // or as an operand.  The def-use manager reads the live instruction lists
+    // directly, so recomputing this each round lets the removal cascade.
+    std::unordered_set<uint32_t> referenced;
+    get_module()->ForEachInst(
+        [&referenced, this](Instruction* inst) {
+          const DebugScope& scope = inst->GetDebugScope();
+          if (scope.GetLexicalScope() != kNoDebugScope)
+            referenced.insert(scope.GetLexicalScope());
+          if (scope.GetInlinedAt() != kNoInlinedAt)
+            referenced.insert(scope.GetInlinedAt());
+          for (const Instruction& line : inst->dbg_line_insts()) {
+            const DebugScope& line_scope = line.GetDebugScope();
+            if (line_scope.GetLexicalScope() != kNoDebugScope)
+              referenced.insert(line_scope.GetLexicalScope());
+            if (line_scope.GetInlinedAt() != kNoInlinedAt)
+              referenced.insert(line_scope.GetInlinedAt());
+          }
+          if (inst->result_id() != 0 && get_def_use_mgr()->NumUsers(inst) != 0)
+            referenced.insert(inst->result_id());
+        },
+        /* run_on_debug_line_insts = */ false);
+
+    std::vector<Instruction*> to_remove;
+    for (Instruction& dbg : get_module()->ext_inst_debuginfo()) {
+      if (!IsLive(&dbg)) continue;
+      if (referenced.count(dbg.result_id()) != 0) continue;
+      switch (dbg.GetCommonDebugOpcode()) {
+        case CommonDebugInfoDebugLocalVariable:
+        case CommonDebugInfoDebugLexicalBlock:
+        case CommonDebugInfoDebugInlinedAt:
+          to_remove.push_back(&dbg);
+          break;
+        default:
+          break;
+      }
+    }
+    for (Instruction* dbg : to_remove) {
+      // Capture the id before |KillInst| deletes the instruction.
+      const uint32_t unique_id = dbg->unique_id();
+      context()->KillInst(dbg);
+      live_insts_.Clear(unique_id);
+      modified = true;
+      ever_modified = true;
+    }
+  }
+  return ever_modified;
+}
+
 void AggressiveDCEPass::ProcessWorkList(Function* func) {
   while (!worklist_.empty()) {
     Instruction* live_inst = worklist_.front();
@@ -851,12 +909,23 @@ Pass::Status AggressiveDCEPass::ProcessImpl() {
     context()->KillInst(inst);
   }
 
+  // Some debug records outlive the instructions they described when those
+  // instructions were eliminated (for example a DebugLocalVariable whose
+  // DebugDeclare and stores were removed, or a DebugInlinedAt that was only
+  // referenced from a dead inline site).  They cannot be explained from the
+  // produced module, so drop them now that all dead code is gone.
+  modified |= RemoveUnusedDebugRecords();
+
   // Cleanup all CFG including all unreachable blocks.
   for (Function& fp : *context()->module()) {
     auto status = CFGCleanup(&fp);
     if (status == Status::Failure) return Status::Failure;
     if (status == Status::SuccessWithChange) modified = true;
   }
+
+  // Unreachable-block removal can also delete the last user of a debug record,
+  // so do one more pass to keep the debug records explainable.
+  modified |= RemoveUnusedDebugRecords();
 
   return modified ? Status::SuccessWithChange : Status::SuccessWithoutChange;
 }
